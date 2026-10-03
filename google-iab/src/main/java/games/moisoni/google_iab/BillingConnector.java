@@ -3,6 +3,7 @@ package games.moisoni.google_iab;
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.BILLING_UNAVAILABLE;
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.DEVELOPER_ERROR;
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.ERROR;
+import static com.android.billingclient.api.BillingClient.BillingResponseCode.FEATURE_NOT_SUPPORTED;
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED;
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.ITEM_NOT_OWNED;
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.ITEM_UNAVAILABLE;
@@ -12,6 +13,7 @@ import static com.android.billingclient.api.BillingClient.BillingResponseCode.SE
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE;
 import static com.android.billingclient.api.BillingClient.BillingResponseCode.USER_CANCELED;
 import static com.android.billingclient.api.BillingClient.FeatureType.SUBSCRIPTIONS;
+import static com.android.billingclient.api.BillingClient.FeatureType.SUBSCRIPTIONS_UPDATE;
 import static com.android.billingclient.api.BillingClient.ProductType.INAPP;
 import static com.android.billingclient.api.BillingClient.ProductType.SUBS;
 
@@ -37,6 +39,7 @@ import com.android.billingclient.api.BillingClientStateListener;
 import com.android.billingclient.api.BillingFlowParams;
 import com.android.billingclient.api.BillingResult;
 import com.android.billingclient.api.ConsumeParams;
+import com.android.billingclient.api.GetBillingConfigParams;
 import com.android.billingclient.api.PendingPurchasesParams;
 import com.android.billingclient.api.ProductDetails;
 import com.android.billingclient.api.Purchase;
@@ -64,6 +67,7 @@ import games.moisoni.google_iab.listeners.ConsumeEventListener;
 import games.moisoni.google_iab.models.BillingResponse;
 import games.moisoni.google_iab.models.ProductInfo;
 import games.moisoni.google_iab.models.PurchaseInfo;
+import games.moisoni.google_iab.models.PurchaseParams;
 
 public class BillingConnector implements DefaultLifecycleObserver {
 
@@ -111,6 +115,11 @@ public class BillingConnector implements DefaultLifecycleObserver {
 
     private volatile boolean isConnected = false;
     private volatile boolean fetchedPurchasedProducts = false;
+    private PurchaseParams defaultPurchaseParams = null;
+
+    private volatile boolean isPendingDeferredChange = false;
+    @Nullable
+    private volatile String pendingDeferredProductId = null;
 
     /**
      * BillingConnector public constructor
@@ -146,64 +155,97 @@ public class BillingConnector implements DefaultLifecycleObserver {
     private void onPurchasesUpdated(@NonNull BillingResult billingResult, List<Purchase> purchases) {
         switch (billingResult.getResponseCode()) {
             case OK:
+                // ✅ FIX - DEFERRED değişiklik bekleniyorsa, GERÇEK sonuç burada -
+                // kullanıcı diyalogda gerçekten onayladı. Normal processPurchases()
+                // akışına SOKMUYORUZ çünkü DEFERRED'de eski abonelik token'ı hâlâ
+                // aktif/değişmeden kalır, yeni bir purchase objesi genelde gelmez -
+                // bu callback'in KENDİSİ "onaylandı" bilgisinin ta kendisi.
+                if (isPendingDeferredChange) {
+                    String scheduledProductId = pendingDeferredProductId;
+                    resetPendingDeferredChange();
+                    findUiHandler().post(() -> billingEventListener.onSubscriptionChangeScheduled(scheduledProductId));
+                    break;
+                }
                 if (purchases != null) {
                     processPurchases(ProductType.COMBINED, purchases, false);
                 }
                 break;
             case USER_CANCELED:
+                resetPendingDeferredChange(); // ✅ FIX - kullanıcı iptal ettiyse bayrak temizlenmeli, aksi halde bir SONRAKİ ilgisiz satın alma yanlışlıkla "planlandı" sanılabilir
                 Log("User pressed back or canceled a dialog." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.USER_CANCELED, billingResult)));
                 break;
             case SERVICE_UNAVAILABLE:
+                resetPendingDeferredChange();
                 Log("Network connection is down." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.SERVICE_UNAVAILABLE, billingResult)));
                 break;
             case BILLING_UNAVAILABLE:
+                resetPendingDeferredChange();
                 Log("Billing API version is not supported for the type requested." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.BILLING_UNAVAILABLE, billingResult)));
                 break;
             case ITEM_UNAVAILABLE:
+                resetPendingDeferredChange();
                 Log("Requested product is not available for purchase." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.ITEM_UNAVAILABLE, billingResult)));
                 break;
             case DEVELOPER_ERROR:
+                resetPendingDeferredChange();
                 Log("Invalid arguments provided to the API." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.DEVELOPER_ERROR, billingResult)));
                 break;
             case ERROR:
+                resetPendingDeferredChange();
                 Log("Fatal error during the API action." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.ERROR, billingResult)));
                 break;
             case ITEM_ALREADY_OWNED:
+                resetPendingDeferredChange();
                 Log("Failure to purchase since item is already owned." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.ITEM_ALREADY_OWNED, billingResult)));
                 break;
             case ITEM_NOT_OWNED:
+                resetPendingDeferredChange();
                 Log("Failure to consume since item is not owned." + " Response code: " + billingResult.getResponseCode());
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.ITEM_NOT_OWNED, billingResult)));
                 break;
             case SERVICE_DISCONNECTED:
+                resetPendingDeferredChange();
                 Log("Initialization error: service disconnected/timeout. Trying to reconnect...");
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.CLIENT_DISCONNECTED, billingResult)));
                 break;
             case NETWORK_ERROR:
+                resetPendingDeferredChange();
                 Log("Initialization error: service network error. Trying to reconnect...");
                 findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
                         new BillingResponse(ErrorType.NETWORK_ERROR, billingResult)));
                 break;
+            case FEATURE_NOT_SUPPORTED:
+                resetPendingDeferredChange();
+                Log("Requested feature is not supported by the Play Store on the current device." + " Response code: " + billingResult.getResponseCode());
+                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
+                        new BillingResponse(ErrorType.BILLING_UNAVAILABLE, billingResult)));
+                break;
             default:
+                resetPendingDeferredChange();
                 Log("Initialization error: " + new BillingResponse(ErrorType.BILLING_ERROR, billingResult));
                 break;
         }
+    }
+
+    private void resetPendingDeferredChange() {
+        isPendingDeferredChange = false;
+        pendingDeferredProductId = null;
     }
 
     /**
@@ -432,9 +474,8 @@ public class BillingConnector implements DefaultLifecycleObserver {
     private void queryProductDetails(String productType, List<QueryProductDetailsParams.Product> productList) {
         QueryProductDetailsParams productDetailsParams = QueryProductDetailsParams.newBuilder().setProductList(productList).build();
 
-        billingClient.queryProductDetailsAsync(productDetailsParams, (billingResult, productDetailsResult) -> {
+        billingClient.queryProductDetailsAsync(productDetailsParams, (billingResult, productDetailsList) -> {
             if (billingResult.getResponseCode() == OK) {
-                List<ProductDetails> productDetailsList = productDetailsResult.getProductDetailsList();
 
                 HashSet<String> foundProductIds = new HashSet<>();
                 for (ProductDetails details : productDetailsList) {
@@ -752,15 +793,37 @@ public class BillingConnector implements DefaultLifecycleObserver {
      * Called to purchase a non-consumable/consumable product
      */
     public final void purchase(Activity activity, String productId) {
-        purchase(activity, productId, notAnOffer);
+        purchase(activity, productId, notAnOffer, null, null, null, -1);
+    }
+
+    /**
+     * Called to purchase a non-consumable/consumable product with custom parameters
+     *
+     * @param purchaseParams - optional purchase parameters (overrides default if set)
+     */
+    public final void purchase(Activity activity, String productId, PurchaseParams purchaseParams) {
+        purchase(activity, productId, notAnOffer, purchaseParams, null, null, -1);
     }
 
     /**
      * Called to purchase a non-consumable/consumable product
      * <p>
      * The offer index represents the different offers in the subscription
+     * <p>
+     * ✅ DEĞİŞTİ (2. revizyon) - oldProductId eklendi. Google, abonelik
+     * değiştirme API'sini YAKIN ZAMANDA değiştirdi:
+     * {@code SubscriptionUpdateParams.setSubscriptionReplacementMode(int)}
+     * DEPRECATED oldu, yerine ÜRÜN SEVİYESİNDE
+     * {@code ProductDetailsParams.setSubscriptionProductReplacementParams(...)}
+     * geldi - bu da eski ABONELİĞİN productId'sini (sadece purchaseToken değil)
+     * bilmeyi ZORUNLU kılıyor. Google'ın kendi kuralı: "Do not call
+     * setSubscriptionReplacementMode if setSubscriptionProductReplacementParams
+     * is called for any product" - yani İKİSİ BİRDEN kullanılamaz, item-level
+     * olan (yeni, doğru) API'yi kullanıyoruz.
      */
-    private void purchase(Activity activity, String productId, int selectedOfferIndex) {
+    private void purchase(Activity activity, String productId, int selectedOfferIndex,
+                          PurchaseParams purchaseParams, @Nullable String oldPurchaseToken,
+                          @Nullable String oldProductId, int replacementMode) {
         if (checkProductBeforeInteraction(productId)) {
             ProductInfo foundProductInfo = null;
             for (ProductInfo productInfo : fetchedProductInfoList) {
@@ -772,47 +835,89 @@ public class BillingConnector implements DefaultLifecycleObserver {
 
             if (foundProductInfo != null) {
                 ProductDetails productDetails = foundProductInfo.getProductDetails();
-                ImmutableList<BillingFlowParams.ProductDetailsParams> productDetailsParamsList;
+                BillingFlowParams.ProductDetailsParams.Builder productDetailsParamsBuilder =
+                        BillingFlowParams.ProductDetailsParams.newBuilder()
+                                .setProductDetails(productDetails);
 
                 if (productDetails.getProductType().equals(SUBS)) {
                     List<ProductDetails.SubscriptionOfferDetails> offerDetails = productDetails.getSubscriptionOfferDetails();
                     if (offerDetails != null && selectedOfferIndex >= 0 && selectedOfferIndex < offerDetails.size()) {
-                        //the offer index represents the different offers in the subscription
-                        //offer index is only available for subscriptions starting with Google Billing v5+
-                        productDetailsParamsList = ImmutableList.of(
-                                BillingFlowParams.ProductDetailsParams.newBuilder()
-                                        .setProductDetails(productDetails)
-                                        .setOfferToken(offerDetails.get(selectedOfferIndex).getOfferToken())
-                                        .build()
-                        );
-                    }
-                    //handle invalid selectedOfferIndex for subscriptions
-                    else {
+                        productDetailsParamsBuilder.setOfferToken(offerDetails.get(selectedOfferIndex).getOfferToken());
+                    } else {
                         Log("Invalid selectedOfferIndex: " + selectedOfferIndex + " for product: " + productId +
                                 ". Offer details size: " + (offerDetails != null ? offerDetails.size() : "null"));
-                        findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.DEVELOPER_ERROR,
-                                "Invalid subscription offer index provided", defaultResponseCode)));
-                        return; //prevent proceeding with an invalid index
+                        findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
+                                new BillingResponse(ErrorType.DEVELOPER_ERROR,
+                                        "Invalid subscription offer index provided", defaultResponseCode)));
+                        return;
+                    }
+
+
+                }
+
+                ImmutableList<BillingFlowParams.ProductDetailsParams> productDetailsParamsList =
+                        ImmutableList.of(productDetailsParamsBuilder.build());
+
+                // Determine which parameters to use
+                PurchaseParams paramsToUse = purchaseParams != null ? purchaseParams : defaultPurchaseParams;
+
+                // BillingFlowParams builder
+                BillingFlowParams.Builder billingFlowParamsBuilder = BillingFlowParams.newBuilder()
+                        .setProductDetailsParamsList(productDetailsParamsList);
+
+                // Apply purchase parameters if available
+                if (paramsToUse != null) {
+                    String accountId = paramsToUse.getObfuscatedAccountId();
+                    String profileId = paramsToUse.getObfuscatedProfileId();
+
+                    if (accountId != null && !accountId.isEmpty()) {
+                        billingFlowParamsBuilder.setObfuscatedAccountId(accountId);
+                        Log("Using obfuscated account ID: " + accountId);
+                    }
+                    if (profileId != null && !profileId.isEmpty()) {
+                        billingFlowParamsBuilder.setObfuscatedProfileId(profileId);
+                        Log("Using obfuscated profile ID: " + profileId);
+                    }
+
+                    if (paramsToUse.hasCustomParams()) {
+                        String customParamsJson = paramsToUse.getCustomParamsAsJson();
+                        if (customParamsJson != null) {
+                            Log("Custom parameters: " + customParamsJson);
+                        }
                     }
                 }
-                //handle IN-APP products (consumable or non-consumable)
-                else {
-                    productDetailsParamsList = ImmutableList.of(
-                            BillingFlowParams.ProductDetailsParams.newBuilder()
-                                    .setProductDetails(productDetails)
-                                    .build()
-                    );
+
+                // ✅ YENİ - SubscriptionUpdateParams artık SADECE oldPurchaseToken
+                // taşıyor - replacement mode ARTIK item-level (yukarıda,
+                // ProductDetailsParams üzerinde) belirleniyor. Google'ın kuralı
+                // gereği İKİSİ BİRDEN set edilemez.
+                if (oldPurchaseToken != null) {
+                    BillingFlowParams.SubscriptionUpdateParams updateParams = BillingFlowParams.SubscriptionUpdateParams.newBuilder()
+                            .setOldPurchaseToken(oldPurchaseToken)
+                            .setSubscriptionReplacementMode(replacementMode)
+                            .build();
+                    billingFlowParamsBuilder.setSubscriptionUpdateParams(updateParams);
                 }
 
-                BillingFlowParams billingFlowParams = BillingFlowParams.newBuilder()
-                        .setProductDetailsParamsList(productDetailsParamsList)
-                        .build();
+                BillingFlowParams billingFlowParams = billingFlowParamsBuilder.build();
+                BillingResult launchResult = billingClient.launchBillingFlow(activity, billingFlowParams);
 
-                billingClient.launchBillingFlow(activity, billingFlowParams);
+                // ✅ FIX - launchResult.getResponseCode()==OK, diyaloğun SADECE
+                // AÇILDIĞINI gösterir, kullanıcının onayladığını DEĞİL. Gerçek
+                // sonuç artık onPurchasesUpdated()'da (isPendingDeferredChange
+                // bayrağı üzerinden) işleniyor - burada sadece "bekliyoruz"
+                // bilgisini set ediyoruz, listener'ı ÇAĞIRMIYORUZ.
+                if (oldPurchaseToken != null
+                        && replacementMode == com.android.billingclient.api.BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.DEFERRED
+                        && launchResult.getResponseCode() == OK) {
+                    isPendingDeferredChange = true;
+                    pendingDeferredProductId = productId;
+                }
             } else {
                 Log("Billing client can not launch billing flow because product details are missing for product: " + productId);
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.PRODUCT_NOT_EXIST,
-                        "Product details not found for " + productId, defaultResponseCode)));
+                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
+                        new BillingResponse(ErrorType.PRODUCT_NOT_EXIST,
+                                "Product details not found for " + productId, defaultResponseCode)));
             }
         }
     }
@@ -1220,7 +1325,15 @@ public class BillingConnector implements DefaultLifecycleObserver {
      * For subscription with only one base package, use subscribe(activity, productId) method or selectedOfferIndex = 0
      */
     public final void subscribe(Activity activity, String productId, int selectedOfferIndex) {
-        purchase(activity, productId, selectedOfferIndex);
+        purchase(activity, productId, selectedOfferIndex, null, null, null, -1);
+    }
+
+    /**
+     * Called to purchase a subscription with offers and custom parameters
+     */
+    public final void subscribe(Activity activity, String productId, int selectedOfferIndex,
+                                PurchaseParams purchaseParams) {
+        purchase(activity, productId, selectedOfferIndex, purchaseParams, null, null, -1);
     }
 
     /**
@@ -1230,7 +1343,83 @@ public class BillingConnector implements DefaultLifecycleObserver {
      * For subscriptions with multiple offers, use subscribe(activity, productId, selectedOfferIndex).
      */
     public final void subscribe(Activity activity, String productId) {
-        purchase(activity, productId, 0);
+        purchase(activity, productId, 0, null, null, null, -1);
+    }
+
+    /**
+     * Called to purchase a simple subscription with custom parameters
+     */
+    public final void subscribe(Activity activity, String productId, PurchaseParams purchaseParams) {
+        purchase(activity, productId, 0, purchaseParams, null, null, -1);
+    }
+
+    /**
+     * ✅ YENİ - abonelik YÜKSELTME/DÜŞÜRME/YAN GEÇİŞ (upgrade/downgrade/crossgrade).
+     * oldPurchaseToken, kullanıcının O AN aktif olan aboneliğinin
+     * purchaseToken'ı OLMAK ZORUNDA - normal subscribe()/purchase() ile
+     * "yükseltme" YAPILAMAZ (Google iki ayrı abonelik sanıp kullanıcıyı
+     * çift faturalandırabilir).
+     */
+    public final void changeSubscription(Activity activity, String newProductId, String oldProductId, String oldPurchaseToken,
+                                         @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int replacementMode) {
+        purchase(activity, newProductId, 0, null, oldPurchaseToken, oldProductId, replacementMode);
+    }
+
+    public final void changeSubscription(Activity activity, String newProductId, String oldProductId, String oldPurchaseToken,
+                                         @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int replacementMode,
+                                         int selectedOfferIndex, PurchaseParams purchaseParams) {
+        purchase(activity, newProductId, selectedOfferIndex, purchaseParams, oldPurchaseToken, oldProductId, replacementMode);
+    }
+
+    /**
+     * ✅ YENİ - cihaz/hesabın abonelik DEĞİŞTİRME (upgrade/downgrade) akışını
+     * destekleyip desteklemediğini kontrol eder - isSubscriptionSupported()'ın
+     * (düz abonelik desteği) AYRI, DAHA DAR bir kontrolü.
+     */
+    public SupportState isSubscriptionUpdateSupported() {
+        BillingResult response = billingClient.isFeatureSupported(SUBSCRIPTIONS_UPDATE);
+        switch (response.getResponseCode()) {
+            case OK:
+                return SupportState.SUPPORTED;
+            case SERVICE_DISCONNECTED:
+                return SupportState.DISCONNECTED;
+            default:
+                return SupportState.NOT_SUPPORTED;
+        }
+    }
+
+    /**
+     * ✅ YENİ - fetchPurchasedProducts()'ın PUBLIC wrapper'ı - kullanıcının
+     * ELLE "satın almaları geri yükle" talebini tetiklemek için (eskiden bu
+     * metod SADECE otomatik/private olarak connect() sonrası çağrılıyordu).
+     */
+    public void refreshPurchases() {
+        fetchPurchasedProducts();
+    }
+
+    /**
+     * ✅ YENİ - kullanıcının Play hesabına göre ülke kodunu döner (bölgesel
+     * fiyatlandırma/uyumluluk kararları için).
+     */
+    public interface BillingConfigListener {
+        void onBillingConfigReceived(@Nullable String countryCode);
+
+        void onBillingConfigError(String message);
+    }
+
+    public void queryBillingConfig(@NonNull BillingConfigListener listener) {
+        if (!billingClient.isReady()) {
+            listener.onBillingConfigError("Billing client is not ready");
+            return;
+        }
+        GetBillingConfigParams params = GetBillingConfigParams.newBuilder().build();
+        billingClient.getBillingConfigAsync(params, (billingResult, billingConfig) -> {
+            if (billingResult.getResponseCode() == OK && billingConfig != null) {
+                listener.onBillingConfigReceived(billingConfig.getCountryCode());
+            } else {
+                listener.onBillingConfigError("Failed to get billing config: " + billingResult.getDebugMessage());
+            }
+        });
     }
 
     /**
@@ -1373,10 +1562,37 @@ public class BillingConnector implements DefaultLifecycleObserver {
     }
 
     /**
+     * Set default purchase parameters to be used in all purchases
+     * This is optional and provides flexible parameter passing
+     */
+    public final BillingConnector setDefaultPurchaseParams(PurchaseParams params) {
+        this.defaultPurchaseParams = params;
+        return this;
+    }
+
+    /**
+     * Get current default purchase parameters
+     */
+    @Nullable
+    public final PurchaseParams getDefaultPurchaseParams() {
+        return defaultPurchaseParams;
+    }
+
+    /**
+     * Clear default purchase parameters
+     */
+    public final BillingConnector clearDefaultPurchaseParams() {
+        this.defaultPurchaseParams = null;
+        return this;
+    }
+
+    /**
      * Checks purchase signature validity
      */
     private boolean isPurchaseSignatureValid(@NonNull Purchase purchase) {
-        return Security.verifyPurchase(base64Key, purchase.getOriginalJson(), purchase.getSignature());
+        boolean valid = Security.verifyPurchase(base64Key, purchase.getOriginalJson(), purchase.getSignature());
+        Log.d("SignatureDebug", "valid=" + valid + " sku=" + purchase.getProducts());
+        return valid;
     }
 
     /**

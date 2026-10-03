@@ -1,12 +1,15 @@
 package games.moisoni.google_iab.models;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.android.billingclient.api.AccountIdentifiers;
 import com.android.billingclient.api.Purchase;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import games.moisoni.google_iab.enums.SkuProductType;
 
@@ -35,6 +38,9 @@ public class PurchaseInfo {
 
     private final boolean isAcknowledged;
     private final boolean isAutoRenewing;
+    private final String obfuscatedAccountId;
+    private final String obfuscatedProfileId;
+    private final Map<String, String> customParams;
 
     public PurchaseInfo(@NonNull ProductInfo productInfo, @NonNull Purchase purchase) {
         this.productInfo = productInfo;
@@ -54,6 +60,19 @@ public class PurchaseInfo {
         this.purchaseTime = purchase.getPurchaseTime();
         this.isAcknowledged = purchase.isAcknowledged();
         this.isAutoRenewing = purchase.isAutoRenewing();
+
+        // Obfuscated parametreleri al (varsa)
+        AccountIdentifiers accountIds = purchase.getAccountIdentifiers();
+        if (accountIds != null) {
+            this.obfuscatedAccountId = accountIds.getObfuscatedAccountId();
+            this.obfuscatedProfileId = accountIds.getObfuscatedProfileId();
+        } else {
+            this.obfuscatedAccountId = null;
+            this.obfuscatedProfileId = null;
+        }
+
+        // Custom parametreleri parse et
+        this.customParams = PurchaseParams.parseCustomParamsFromJson(purchase.getDeveloperPayload());
     }
 
     public SkuProductType getSkuProductType() {
@@ -130,5 +149,44 @@ public class PurchaseInfo {
 
     public boolean isPending() {
         return purchaseState == Purchase.PurchaseState.PENDING;
+    }
+
+    /**
+     * Returns obfuscated account ID if set during purchase
+     */
+    @Nullable
+    public String getObfuscatedAccountId() {
+        return obfuscatedAccountId;
+    }
+
+    /**
+     * Returns obfuscated profile ID if set during purchase
+     */
+    @Nullable
+    public String getObfuscatedProfileId() {
+        return obfuscatedProfileId;
+    }
+
+    /**
+     * Returns all custom parameters sent during purchase
+     */
+    @NonNull
+    public Map<String, String> getCustomParams() {
+        return new HashMap<>(customParams);
+    }
+
+    /**
+     * Returns a specific custom parameter value
+     */
+    @Nullable
+    public String getCustomParam(String key) {
+        return customParams.get(key);
+    }
+
+    /**
+     * Check if custom parameters exist
+     */
+    public boolean hasCustomParams() {
+        return !customParams.isEmpty();
     }
 }

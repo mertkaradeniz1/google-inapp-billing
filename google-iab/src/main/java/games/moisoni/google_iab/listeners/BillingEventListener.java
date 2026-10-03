@@ -62,4 +62,14 @@ public interface BillingEventListener {
      * @param response  - provides information about the error
      */
     void onProductQueryError(@NonNull String productId, @NonNull BillingResponse response);
+
+    /**
+     * ✅ YENİ - SADECE DEFERRED modlu bir changeSubscription() sonrası
+     * tetiklenir. DEFERRED'da değişiklik ANINDA uygulanmaz (mevcut dönemin
+     * SONUNDA devreye girer), bu yüzden normal onProductsPurchased() akışı
+     * HİÇ TETİKLENMEZ - Google Play sadece "değişiklik planlandı" der.
+     * Varsayılan (default) boş bırakıldı - DEFERRED kullanmayan
+     * implementasyonlar bunu override ETMEK ZORUNDA DEĞİL.
+     */
+    default void onSubscriptionChangeScheduled(@NonNull String productId) {}
 }
