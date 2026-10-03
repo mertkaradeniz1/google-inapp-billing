@@ -278,6 +278,12 @@ billingConnector.setBillingEventListener(new BillingEventListener() {
 });
 ```
 
+After registering the listener, connect to Google Play Billing:
+
+```java
+billingConnector.connect();
+```
+
 # Initiate Purchase
 
 * Purchase a non-consumable/consumable product:
@@ -337,5 +343,3 @@ It also shows a simple logic for a "remove ads button" scenario.
 This is an open-source project meant to help developers to fastly and easily implement the Google Billing API.
 
 The library uses a code base from a fork created by [@Mustafa Rasheed](https://github.com/MRZ07) and was heavily modified by me and later by other contributors.
-
-
