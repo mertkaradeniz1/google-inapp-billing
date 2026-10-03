@@ -53,6 +53,7 @@ public class BillingConnector implements DefaultLifecycleObserver {
     private volatile boolean released;
     private volatile boolean fetchedPurchasedProducts;
     private boolean connecting, reconnectScheduled, refreshing, refreshAgain;
+    private boolean configurationLocked;
     private int reconnectAttempt;
     private long catalogGeneration;
     private boolean autoConsume, autoAcknowledge, logging;
@@ -152,7 +153,7 @@ public class BillingConnector implements DefaultLifecycleObserver {
     }
     private void requireConfigurable() {
         requireUsable();
-        if (connecting || billingClient.isReady() || refreshing)
+        if (configurationLocked)
             throw new IllegalStateException("Configure product IDs before connect()");
     }
     public final BillingConnector setConsumableIds(List<String> ids) {
@@ -186,6 +187,7 @@ public class BillingConnector implements DefaultLifecycleObserver {
         requireUsable();
         if (listener == null) throw new IllegalStateException("Set BillingEventListener before connect()");
         configureTypes();
+        configurationLocked = true;
         if (connecting) return this;
         handler.removeCallbacks(reconnectTask); reconnectScheduled = false;
         if (billingClient.isReady()) { refreshPurchases(); return this; }
@@ -200,7 +202,6 @@ public class BillingConnector implements DefaultLifecycleObserver {
                         refreshPurchases(); refreshProducts();
                     } else {
                         error(errorType(result.getResponseCode()), result);
-                        if (BillingRules.isTransient(result.getResponseCode())) scheduleReconnect();
                     }
                 });
             }
@@ -208,7 +209,6 @@ public class BillingConnector implements DefaultLifecycleObserver {
                 onMain(() -> {
                     connecting = false;
                     error(ErrorType.CLIENT_DISCONNECTED, "Google Play billing service disconnected");
-                    scheduleReconnect();
                 });
             }
         });
@@ -222,7 +222,6 @@ public class BillingConnector implements DefaultLifecycleObserver {
     private boolean readyOrError() {
         if (!isReady()) {
             error(ErrorType.CLIENT_NOT_READY, "Billing client is not ready");
-            if (!released) scheduleReconnect();
             return false;
         }
         return true;
@@ -364,7 +363,6 @@ public class BillingConnector implements DefaultLifecycleObserver {
         if (result.getResponseCode() != OK) {
             activeFlow = null; error(errorType(result.getResponseCode()), result);
             if (result.getResponseCode() == ITEM_ALREADY_OWNED) refreshPurchases();
-            if (result.getResponseCode() == SERVICE_DISCONNECTED) scheduleReconnect();
             return;
         }
         if (purchases == null || purchases.isEmpty()) { refreshPurchases(); return; }
@@ -471,7 +469,6 @@ public class BillingConnector implements DefaultLifecycleObserver {
     private void finishAttempt(PurchaseInfo info, boolean consume, int attempt) {
         if (released) return;
         if (!billingClient.isReady()) {
-            scheduleReconnect();
             finalizationResult(info, consume, attempt, BillingResult.newBuilder()
                     .setResponseCode(SERVICE_DISCONNECTED).setDebugMessage("Billing service disconnected").build());
             return;
@@ -569,17 +566,17 @@ public class BillingConnector implements DefaultLifecycleObserver {
     }
     /** Legacy replacement mode values are mapped to the new item-level values. */
     public final void changeSubscription(Activity activity, String newId, String oldId, String token,
-            @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int mode) {
+                                         @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int mode) {
         changeSubscription(activity, newId, oldId, token, mode, 0, null);
     }
     public final void changeSubscription(Activity activity, String newId, String oldId, String token,
-            @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int mode, int index, PurchaseParams params) {
+                                         @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int mode, int index, PurchaseParams params) {
         startFlow(activity, newId, index, null, params, requireText(token, "oldPurchaseToken"),
                 requireText(oldId, "oldProductId"), BillingRules.productReplacementMode(mode), true);
     }
     /** Uses the NEW ProductDetailsParams replacement-mode constants, not the legacy constants. */
     public final void changeSubscriptionWithProductReplacementMode(Activity activity, String newId, String oldId,
-            String token, int mode, String offerToken, PurchaseParams params) {
+                                                                   String token, int mode, String offerToken, PurchaseParams params) {
         if (mode < 1 || mode > 6) throw new IllegalArgumentException("Invalid product replacement mode");
         startFlow(activity, newId, -1, offerToken, params, requireText(token, "oldPurchaseToken"),
                 requireText(oldId, "oldProductId"), mode, true);
@@ -618,7 +615,7 @@ public class BillingConnector implements DefaultLifecycleObserver {
         String type = subscription ? SUBS : INAPP;
         // Always obtain fresh ProductDetails immediately before launch.
         billingClient.queryProductDetailsAsync(QueryProductDetailsParams.newBuilder().setProductList(
-                Collections.singletonList(QueryProductDetailsParams.Product.newBuilder().setProductId(id).setProductType(type).build())).build(),
+                        Collections.singletonList(QueryProductDetailsParams.Product.newBuilder().setProductId(id).setProductType(type).build())).build(),
                 (result, details) -> onMain(() -> {
                     if (activeFlow != flow) return;
                     if (result.getResponseCode() != OK) { activeFlow = null; error(ErrorType.BILLING_ERROR, result); return; }
