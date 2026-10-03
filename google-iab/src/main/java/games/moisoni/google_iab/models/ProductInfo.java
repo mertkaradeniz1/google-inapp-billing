@@ -23,6 +23,7 @@ public class ProductInfo {
     private final long oneTimePurchaseOfferPriceAmountMicros;
     private final String oneTimePurchaseOfferPriceCurrencyCode;
     private final List<SubscriptionOfferDetails> subscriptionOfferDetails;
+    private final List<ProductDetails.OneTimePurchaseOfferDetails> oneTimePurchaseOffers;
 
     public ProductInfo(SkuProductType skuProductType, @NonNull ProductDetails productDetails) {
         this.skuProductType = skuProductType;
@@ -33,6 +34,9 @@ public class ProductInfo {
         this.type = productDetails.getProductType();
         this.name = productDetails.getName();
 
+        List<ProductDetails.OneTimePurchaseOfferDetails> offers = productDetails.getOneTimePurchaseOfferDetailsList();
+        this.oneTimePurchaseOffers = offers == null ? Collections.emptyList()
+                : Collections.unmodifiableList(new ArrayList<>(offers));
         ProductDetails.OneTimePurchaseOfferDetails offerDetails = productDetails.getOneTimePurchaseOfferDetails();
         if (offerDetails != null) {
             this.oneTimePurchaseOfferFormattedPrice = offerDetails.getFormattedPrice();
@@ -95,12 +99,16 @@ public class ProductInfo {
         return oneTimePurchaseOfferPriceCurrencyCode;
     }
 
+    public List<ProductDetails.OneTimePurchaseOfferDetails> getOneTimePurchaseOffers() {
+        return oneTimePurchaseOffers;
+    }
+
     public List<SubscriptionOfferDetails> getSubscriptionOfferDetails() {
         return Collections.unmodifiableList(subscriptionOfferDetails);
     }
 
     @NonNull
     private SubscriptionOfferDetails createSubscriptionOfferDetails(@NonNull ProductDetails.SubscriptionOfferDetails offerDetails) {
-        return new SubscriptionOfferDetails(offerDetails.getOfferId(), offerDetails.getPricingPhases().getPricingPhaseList(), offerDetails.getOfferTags(), offerDetails.getOfferToken(), offerDetails.getBasePlanId());
+        return new SubscriptionOfferDetails(offerDetails.getOfferId(), offerDetails.getPricingPhases().getPricingPhaseList(), offerDetails.getOfferTags(), offerDetails.getOfferToken(), offerDetails.getBasePlanId(), offerDetails.getInstallmentPlanDetails());
     }
 }

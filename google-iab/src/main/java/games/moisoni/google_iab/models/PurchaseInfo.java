@@ -6,7 +6,9 @@ import androidx.annotation.Nullable;
 import com.android.billingclient.api.AccountIdentifiers;
 import com.android.billingclient.api.Purchase;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Objects;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,19 +38,27 @@ public class PurchaseInfo {
 
     private final long purchaseTime;
 
-    private final boolean isAcknowledged;
+    private volatile boolean isAcknowledged;
     private final boolean isAutoRenewing;
     private final String obfuscatedAccountId;
     private final String obfuscatedProfileId;
     private final Map<String, String> customParams;
 
     public PurchaseInfo(@NonNull ProductInfo productInfo, @NonNull Purchase purchase) {
+        this(productInfo.getProduct(), productInfo.getSkuProductType(), productInfo, purchase,
+                Collections.emptyMap());
+    }
+
+    /** A purchase remains usable even when its catalog entry cannot be fetched. */
+    public PurchaseInfo(@NonNull String productId, @NonNull SkuProductType productType,
+                        @Nullable ProductInfo productInfo, @NonNull Purchase purchase,
+                        @NonNull Map<String, String> localCustomParams) {
         this.productInfo = productInfo;
         this.purchase = purchase;
-        this.product = productInfo.getProduct();
-        this.skuProductType = productInfo.getSkuProductType();
+        this.product = productId;
+        this.skuProductType = productType;
         this.accountIdentifiers = purchase.getAccountIdentifiers();
-        this.products = purchase.getProducts();
+        this.products = Collections.unmodifiableList(new ArrayList<>(purchase.getProducts()));
         this.orderId = purchase.getOrderId();
         this.purchaseToken = purchase.getPurchaseToken();
         this.originalJson = purchase.getOriginalJson();
@@ -71,14 +81,15 @@ public class PurchaseInfo {
             this.obfuscatedProfileId = null;
         }
 
-        // Custom parametreleri parse et
-        this.customParams = PurchaseParams.parseCustomParamsFromJson(purchase.getDeveloperPayload());
+        // Local app metadata, never parsed from deprecated developerPayload
+        this.customParams = Collections.unmodifiableMap(new HashMap<>(localCustomParams));
     }
 
     public SkuProductType getSkuProductType() {
         return skuProductType;
     }
 
+    @Nullable
     public ProductInfo getProductInfo() {
         return productInfo;
     }
@@ -139,12 +150,32 @@ public class PurchaseInfo {
         return isAcknowledged;
     }
 
+    public void markAcknowledged() { this.isAcknowledged = true; }
+
+    public boolean isSuspended() { return purchase.isSuspended(); }
+
+    @Nullable
+    public Purchase.PendingPurchaseUpdate getPendingPurchaseUpdate() {
+        return purchase.getPendingPurchaseUpdate();
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) return true;
+        if (!(other instanceof PurchaseInfo)) return false;
+        PurchaseInfo info = (PurchaseInfo) other;
+        return Objects.equals(purchaseToken, info.purchaseToken) && Objects.equals(product, info.product);
+    }
+
+    @Override
+    public int hashCode() { return Objects.hash(purchaseToken, product); }
+
     public boolean isAutoRenewing() {
         return isAutoRenewing;
     }
 
     public boolean isPurchased() {
-        return purchaseState == Purchase.PurchaseState.PURCHASED;
+        return purchaseState == Purchase.PurchaseState.PURCHASED && !purchase.isSuspended();
     }
 
     public boolean isPending() {
@@ -168,7 +199,7 @@ public class PurchaseInfo {
     }
 
     /**
-     * Returns all custom parameters sent during purchase
+     * Returns app-local metadata; Google does not transport these custom parameters
      */
     @NonNull
     public Map<String, String> getCustomParams() {

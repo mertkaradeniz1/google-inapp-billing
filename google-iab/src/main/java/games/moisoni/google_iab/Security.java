@@ -7,6 +7,7 @@ import android.util.Log;
 import androidx.annotation.NonNull;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
@@ -42,7 +43,7 @@ class Security {
         try {
             PublicKey key = generatePublicKey(base64PublicKey);
             return verify(key, signedData, signature);
-        } catch (IOException e) {
+        } catch (IOException | IllegalArgumentException e) {
             Log.e(TAG, "Error generating PublicKey from encoded key: " + e.getMessage());
             return false;
         }
@@ -80,7 +81,7 @@ class Security {
      * @return true if the data and signature match
      */
     @NonNull
-    static private Boolean verify(PublicKey publicKey, String signedData, String signature) {
+    static private boolean verify(PublicKey publicKey, String signedData, String signature) {
         byte[] signatureBytes;
         try {
             signatureBytes = Base64.decode(signature, Base64.DEFAULT);
@@ -91,7 +92,7 @@ class Security {
         try {
             Signature signatureAlgorithm = Signature.getInstance(SIGNATURE_ALGORITHM);
             signatureAlgorithm.initVerify(publicKey);
-            signatureAlgorithm.update(signedData.getBytes());
+            signatureAlgorithm.update(signedData.getBytes(StandardCharsets.UTF_8));
             if (!signatureAlgorithm.verify(signatureBytes)) {
                 Log.w(TAG, "Signature verification failed...");
                 return false;

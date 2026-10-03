@@ -14,6 +14,7 @@ public class PurchaseParams {
 
     private String obfuscatedAccountId;
     private String obfuscatedProfileId;
+    private boolean offerPersonalized;
     private final Map<String, String> customParams;
 
     public PurchaseParams() {
@@ -24,6 +25,7 @@ public class PurchaseParams {
      * Set obfuscated account ID (Google Play built-in parameter)
      */
     public PurchaseParams setObfuscatedAccountId(String accountId) {
+        validateId(accountId);
         this.obfuscatedAccountId = accountId;
         return this;
     }
@@ -32,13 +34,27 @@ public class PurchaseParams {
      * Set obfuscated profile ID (Google Play built-in parameter)
      */
     public PurchaseParams setObfuscatedProfileId(String profileId) {
+        validateId(profileId);
         this.obfuscatedProfileId = profileId;
         return this;
     }
 
     /**
+     * Marks the price as personalized for disclosure requirements such as EU CRD Article 6(1)(ea).
+     * This value is forwarded to BillingFlowParams.setIsOfferPersonalized().
+     */
+    public PurchaseParams setOfferPersonalized(boolean personalized) {
+        this.offerPersonalized = personalized;
+        return this;
+    }
+
+    public boolean isOfferPersonalized() {
+        return offerPersonalized;
+    }
+
+    /**
      * Add a custom parameter
-     * This will be stored as JSON in developerPayload
+     * This is app-local metadata. It is NOT sent to Google Play.
      */
     public PurchaseParams addCustomParam(String key, String value) {
         if (key != null && value != null) {
@@ -82,7 +98,9 @@ public class PurchaseParams {
      */
     public PurchaseParams addCustomParams(Map<String, String> params) {
         if (params != null) {
-            this.customParams.putAll(params);
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                addCustomParam(entry.getKey(), entry.getValue());
+            }
         }
         return this;
     }
@@ -143,7 +161,7 @@ public class PurchaseParams {
     }
 
     /**
-     * Convert custom parameters to JSON string for developerPayload
+     * Serialize local custom metadata for your own backend; not a Play Billing payload
      */
     @Nullable
     public String getCustomParamsAsJson() {
@@ -193,17 +211,23 @@ public class PurchaseParams {
         PurchaseParams copy = new PurchaseParams();
         copy.obfuscatedAccountId = this.obfuscatedAccountId;
         copy.obfuscatedProfileId = this.obfuscatedProfileId;
+        copy.offerPersonalized = this.offerPersonalized;
         copy.customParams.putAll(this.customParams);
         return copy;
+    }
+
+    private static void validateId(String id) {
+        if (id != null && (id.isEmpty() || id.length() > 64)) {
+            throw new IllegalArgumentException("Obfuscated identifiers must contain 1 to 64 characters");
+        }
     }
 
     @NonNull
     @Override
     public String toString() {
-        return "PurchaseParams{" +
-                "obfuscatedAccountId='" + obfuscatedAccountId + '\'' +
-                ", obfuscatedProfileId='" + obfuscatedProfileId + '\'' +
-                ", customParams=" + customParams +
-                '}';
+        return "PurchaseParams{hasAccountId=" + (obfuscatedAccountId != null)
+                + ", hasProfileId=" + (obfuscatedProfileId != null)
+                + ", offerPersonalized=" + offerPersonalized
+                + ", customParamCount=" + customParams.size() + "}";
     }
 }

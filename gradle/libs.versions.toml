@@ -1,17 +1,36 @@
 [versions]
+annotation = "1.11.0"
+appcompatVersion = "1.8.0"
+bounceviewAndroid = "0.2.0"
+constraintlayout = "2.2.2"
 junit = "4.13.2"
 extJunit = "1.3.0"
 espresso = "3.7.0"
-appcompat = "1.7.1"
-material = "1.13.0"
-guava = "33.4.0-android"
-billing = "7.0.0"
+appcompat = "1.8.0"
+kotlinBom = "1.8.22"
+lifecycleCommon = "2.11.0"
+material = "1.14.0"
+guava = "33.7.2-android"
+billing = "9.1.0"
+materialVersion = "1.14.0"
+sdpAndroid = "1.1.1"
+sspAndroid = "1.1.1"
 
 [libraries]
+annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
+appcompat-v180 = { module = "androidx.appcompat:appcompat", version.ref = "appcompatVersion" }
+bounceview-android = { module = "io.github.hariprasanths:bounceview-android", version.ref = "bounceviewAndroid" }
+constraintlayout = { module = "androidx.constraintlayout:constraintlayout", version.ref = "constraintlayout" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "extJunit" }
 espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espresso" }
 appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+kotlin-bom = { module = "org.jetbrains.kotlin:kotlin-bom", version.ref = "kotlinBom" }
+kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib" }
+lifecycle-common = { module = "androidx.lifecycle:lifecycle-common", version.ref = "lifecycleCommon" }
 material = { group = "com.google.android.material", name = "material", version.ref = "material" }
 guava = { group = "com.google.guava", name = "guava", version.ref = "guava" }
 billing = { group = "com.android.billingclient", name = "billing", version.ref = "billing" }
+material-v1140 = { module = "com.google.android.material:material", version.ref = "materialVersion" }
+sdp-android = { module = "com.intuit.sdp:sdp-android", version.ref = "sdpAndroid" }
+ssp-android = { module = "com.intuit.ssp:ssp-android", version.ref = "sspAndroid" }

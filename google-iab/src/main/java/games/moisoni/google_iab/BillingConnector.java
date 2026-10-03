@@ -1,19 +1,6 @@
 package games.moisoni.google_iab;
 
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.BILLING_UNAVAILABLE;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.DEVELOPER_ERROR;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.ERROR;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.FEATURE_NOT_SUPPORTED;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.ITEM_NOT_OWNED;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.ITEM_UNAVAILABLE;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.NETWORK_ERROR;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.OK;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.SERVICE_DISCONNECTED;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE;
-import static com.android.billingclient.api.BillingClient.BillingResponseCode.USER_CANCELED;
-import static com.android.billingclient.api.BillingClient.FeatureType.SUBSCRIPTIONS;
-import static com.android.billingclient.api.BillingClient.FeatureType.SUBSCRIPTIONS_UPDATE;
+import static com.android.billingclient.api.BillingClient.BillingResponseCode.*;
 import static com.android.billingclient.api.BillingClient.ProductType.INAPP;
 import static com.android.billingclient.api.BillingClient.ProductType.SUBS;
 
@@ -21,7 +8,6 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
@@ -33,1605 +19,789 @@ import androidx.lifecycle.DefaultLifecycleObserver;
 import androidx.lifecycle.Lifecycle;
 import androidx.lifecycle.LifecycleOwner;
 
-import com.android.billingclient.api.AcknowledgePurchaseParams;
-import com.android.billingclient.api.BillingClient;
-import com.android.billingclient.api.BillingClientStateListener;
-import com.android.billingclient.api.BillingFlowParams;
-import com.android.billingclient.api.BillingResult;
-import com.android.billingclient.api.ConsumeParams;
-import com.android.billingclient.api.GetBillingConfigParams;
-import com.android.billingclient.api.PendingPurchasesParams;
-import com.android.billingclient.api.ProductDetails;
-import com.android.billingclient.api.Purchase;
-import com.android.billingclient.api.QueryProductDetailsParams;
-import com.android.billingclient.api.QueryPurchasesParams;
-import com.google.common.collect.ImmutableList;
-
+import com.android.billingclient.api.*;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.Set;
 
-import games.moisoni.google_iab.enums.ErrorType;
-import games.moisoni.google_iab.enums.ProductType;
-import games.moisoni.google_iab.enums.PurchasedResult;
-import games.moisoni.google_iab.enums.SkuProductType;
-import games.moisoni.google_iab.enums.SupportState;
-import games.moisoni.google_iab.listeners.AcknowledgeEventListener;
+import games.moisoni.google_iab.enums.*;
+import games.moisoni.google_iab.internal.BillingRules;
+import games.moisoni.google_iab.internal.PurchaseLedger;
 import games.moisoni.google_iab.listeners.BillingEventListener;
-import games.moisoni.google_iab.listeners.ConsumeEventListener;
-import games.moisoni.google_iab.models.BillingResponse;
-import games.moisoni.google_iab.models.ProductInfo;
-import games.moisoni.google_iab.models.PurchaseInfo;
-import games.moisoni.google_iab.models.PurchaseParams;
+import games.moisoni.google_iab.models.*;
 
+/**
+ * Google Play Billing 9.0 connector. Create, configure and call mutating methods on the main
+ * thread. Listener callbacks run on that thread. Getter methods return defensive snapshots.
+ * Backend verification and durable, token-idempotent entitlement delivery belong to the app.
+ * Auto-finalization is opt-in and suitable only when delivery can safely precede finalization.
+ */
 public class BillingConnector implements DefaultLifecycleObserver {
-
-    private final Handler uiHandler;
-
+    private static final int LOCAL_ERROR = 99;
+    private static final int MAX_ATTEMPTS = 3;
     private static final String TAG = "BillingConnector";
-    private static final int defaultResponseCode = 99; //custom response code not used by the official BillingClient API
-
-    private static final int notAnOffer = -1;
-
-    private static final long RECONNECT_TIMER_START_MILLISECONDS = 1000L;
-    private static final long RECONNECT_TIMER_MAX_TIME_MILLISECONDS = 1000L * 60L * 15L;
-    private final AtomicLong reconnectMilliseconds = new AtomicLong(RECONNECT_TIMER_START_MILLISECONDS);
-
-    private static final int MAX_PENDING_RETRIES = 3;
-    private static final long INITIAL_RETRY_DELAY_MS = 1000L;
-    private static final long MAX_RETRY_DELAY_MS = 10000L;
-    private static final long MAX_PENDING_DURATION_MS = 1000 * 60 * 5;
-
-    private final String base64Key;
-
     private final Context context;
-    private Lifecycle lifecycle;
+    private final String base64Key;
+    private final Handler handler;
+    private final BillingClient billingClient;
+    private final Lifecycle lifecycle;
+    private volatile BillingEventListener listener;
+    private volatile boolean released;
+    private volatile boolean fetchedPurchasedProducts;
+    private boolean connecting, reconnectScheduled, refreshing, refreshAgain;
+    private int reconnectAttempt;
+    private long catalogGeneration;
+    private boolean autoConsume, autoAcknowledge, logging;
+    private List<String> consumableIds = Collections.emptyList();
+    private List<String> nonConsumableIds = Collections.emptyList();
+    private List<String> subscriptionIds = Collections.emptyList();
+    private final Map<String, SkuProductType> configuredTypes = new LinkedHashMap<>();
+    private final Map<String, ProductInfo> catalog = new LinkedHashMap<>();
+    private final PurchaseLedger<PurchaseInfo> ledger = new PurchaseLedger<>();
+    private final Set<String> deliveredStates = new HashSet<>();
+    private final Set<String> deliveredPendingUpdates = new HashSet<>();
+    private final Map<String, Map<String, String>> localMetadataByToken = new LinkedHashMap<>();
+    private final Set<String> acknowledgedTokens = new HashSet<>();
+    private final Set<String> finalizingTokens = new HashSet<>();
+    private final Set<String> pollingTokens = new HashSet<>();
+    private PurchaseParams defaultPurchaseParams;
+    private Flow activeFlow;
+    private final Map<String, String> deferredTargets = new LinkedHashMap<>();
+    private final Runnable reconnectTask = () -> { reconnectScheduled = false; connect(); };
 
-    private BillingClient billingClient;
-    private BillingEventListener billingEventListener;
+    private static final class Batch {
+        int remaining;
+        boolean successful = true;
+        Batch(int count) { remaining = count; }
+    }
+    private static final class Flow {
+        final String productId, oldProductId, oldToken;
+        final int mode;
+        final PurchaseParams params;
+        Flow(String productId, String oldProductId, String oldToken, int mode, PurchaseParams params) {
+            this.productId = productId; this.oldProductId = oldProductId; this.oldToken = oldToken;
+            this.mode = mode; this.params = params;
+        }
+    }
 
-    private List<String> consumableIds;
-    private List<String> nonConsumableIds;
-    private List<String> subscriptionIds;
-
-    private final List<QueryProductDetailsParams.Product> allProductList = new ArrayList<>();
-
-    private final List<ProductInfo> fetchedProductInfoList = new ArrayList<>();
-    private final List<PurchaseInfo> purchasedProductsList = new ArrayList<>();
-
-    private final Object purchasedProductsSync = new Object(); //object for thread safety
-
-    private int productDetailsQueriesPending;
-    private int purchaseQueriesPending;
-
-    private boolean shouldAutoAcknowledge = false;
-    private boolean shouldAutoConsume = false;
-    private boolean shouldEnableLogging = false;
-
-    private volatile boolean isConnected = false;
-    private volatile boolean fetchedPurchasedProducts = false;
-    private PurchaseParams defaultPurchaseParams = null;
-
-    private volatile boolean isPendingDeferredChange = false;
-    @Nullable
-    private volatile String pendingDeferredProductId = null;
-
-    /**
-     * BillingConnector public constructor
-     *
-     * @param context   - is the application context
-     * @param base64Key - is the public developer key from Play Console
-     * @param lifecycle - (optional) the lifecycle object to automatically manage the BillingConnector's
-     *                  lifecycle. If provided, the connector will automatically handle connection
-     *                  cleanup when the lifecycle owner is destroyed. Can be null if manual lifecycle
-     *                  management is preferred.
-     */
     public BillingConnector(@NonNull Context context, String base64Key, @Nullable Lifecycle lifecycle) {
+        this(context, base64Key, lifecycle, null, new Handler(Looper.getMainLooper()));
+    }
+
+    // Package-private injection seam used by JVM regression tests.
+    BillingConnector(Context context, String base64Key, Lifecycle lifecycle, BillingClient client, Handler uiHandler) {
+        requireMain();
+        if (base64Key == null || base64Key.trim().isEmpty())
+            throw new IllegalArgumentException("Play Console public license key is required");
         this.context = context.getApplicationContext();
         this.base64Key = base64Key;
-        if (lifecycle != null) {
-            this.lifecycle = lifecycle;
-            lifecycle.addObserver(this);
-        }
-        this.uiHandler = new Handler(Looper.getMainLooper());
-        this.init();
-    }
-
-    /**
-     * To initialize BillingConnector
-     */
-    private void init() {
-        billingClient = BillingClient.newBuilder(context)
-                .enablePendingPurchases(PendingPurchasesParams.newBuilder().enablePrepaidPlans().enableOneTimeProducts().build())
-                .setListener(this::onPurchasesUpdated)
+        this.lifecycle = lifecycle;
+        this.handler = uiHandler;
+        billingClient = client != null ? client : BillingClient.newBuilder(this.context)
+                .enablePendingPurchases(PendingPurchasesParams.newBuilder()
+                        .enableOneTimeProducts().enablePrepaidPlans().build())
+                .setListener((result, purchases) -> onMain(() -> onPurchasesUpdated(result, purchases)))
+                .enableAutoServiceReconnection()
                 .build();
+        if (lifecycle != null) lifecycle.addObserver(this);
     }
+    private static void requireMain() {
+        if (Looper.myLooper() != Looper.getMainLooper())
+            throw new IllegalStateException("BillingConnector mutating methods must run on the main thread");
+    }
+    private void requireUsable() {
+        requireMain();
+        if (released) throw new IllegalStateException("BillingConnector has been released; create a new instance");
+    }
+    private void onMain(Runnable action) {
+        if (released) return;
+        if (Looper.myLooper() == Looper.getMainLooper()) action.run();
+        else handler.post(() -> { if (!released) action.run(); });
+    }
+    private interface ListenerEvent { void accept(BillingEventListener listener); }
+    private void emit(ListenerEvent event) {
+        handler.post(() -> { BillingEventListener current = listener;
+            if (!released && current != null) event.accept(current);
+        });
+    }
+    private void error(ErrorType type, BillingResult result) {
+        emit(l -> l.onBillingError(this, new BillingResponse(type, result)));
+    }
+    private void error(ErrorType type, String message) {
+        emit(l -> l.onBillingError(this, new BillingResponse(type, message, LOCAL_ERROR)));
+    }
+    private void log(String message) { if (logging) Log.d(TAG, message); }
 
-    private void onPurchasesUpdated(@NonNull BillingResult billingResult, List<Purchase> purchases) {
-        switch (billingResult.getResponseCode()) {
-            case OK:
-                // ✅ FIX - DEFERRED değişiklik bekleniyorsa, GERÇEK sonuç burada -
-                // kullanıcı diyalogda gerçekten onayladı. Normal processPurchases()
-                // akışına SOKMUYORUZ çünkü DEFERRED'de eski abonelik token'ı hâlâ
-                // aktif/değişmeden kalır, yeni bir purchase objesi genelde gelmez -
-                // bu callback'in KENDİSİ "onaylandı" bilgisinin ta kendisi.
-                if (isPendingDeferredChange) {
-                    String scheduledProductId = pendingDeferredProductId;
-                    resetPendingDeferredChange();
-                    findUiHandler().post(() -> billingEventListener.onSubscriptionChangeScheduled(scheduledProductId));
-                    break;
-                }
-                if (purchases != null) {
-                    processPurchases(ProductType.COMBINED, purchases, false);
-                }
-                break;
-            case USER_CANCELED:
-                resetPendingDeferredChange(); // ✅ FIX - kullanıcı iptal ettiyse bayrak temizlenmeli, aksi halde bir SONRAKİ ilgisiz satın alma yanlışlıkla "planlandı" sanılabilir
-                Log("User pressed back or canceled a dialog." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.USER_CANCELED, billingResult)));
-                break;
-            case SERVICE_UNAVAILABLE:
-                resetPendingDeferredChange();
-                Log("Network connection is down." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.SERVICE_UNAVAILABLE, billingResult)));
-                break;
-            case BILLING_UNAVAILABLE:
-                resetPendingDeferredChange();
-                Log("Billing API version is not supported for the type requested." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.BILLING_UNAVAILABLE, billingResult)));
-                break;
-            case ITEM_UNAVAILABLE:
-                resetPendingDeferredChange();
-                Log("Requested product is not available for purchase." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.ITEM_UNAVAILABLE, billingResult)));
-                break;
-            case DEVELOPER_ERROR:
-                resetPendingDeferredChange();
-                Log("Invalid arguments provided to the API." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.DEVELOPER_ERROR, billingResult)));
-                break;
-            case ERROR:
-                resetPendingDeferredChange();
-                Log("Fatal error during the API action." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.ERROR, billingResult)));
-                break;
-            case ITEM_ALREADY_OWNED:
-                resetPendingDeferredChange();
-                Log("Failure to purchase since item is already owned." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.ITEM_ALREADY_OWNED, billingResult)));
-                break;
-            case ITEM_NOT_OWNED:
-                resetPendingDeferredChange();
-                Log("Failure to consume since item is not owned." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.ITEM_NOT_OWNED, billingResult)));
-                break;
-            case SERVICE_DISCONNECTED:
-                resetPendingDeferredChange();
-                Log("Initialization error: service disconnected/timeout. Trying to reconnect...");
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.CLIENT_DISCONNECTED, billingResult)));
-                break;
-            case NETWORK_ERROR:
-                resetPendingDeferredChange();
-                Log("Initialization error: service network error. Trying to reconnect...");
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.NETWORK_ERROR, billingResult)));
-                break;
-            case FEATURE_NOT_SUPPORTED:
-                resetPendingDeferredChange();
-                Log("Requested feature is not supported by the Play Store on the current device." + " Response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.BILLING_UNAVAILABLE, billingResult)));
-                break;
-            default:
-                resetPendingDeferredChange();
-                Log("Initialization error: " + new BillingResponse(ErrorType.BILLING_ERROR, billingResult));
-                break;
+    public final void setBillingEventListener(@Nullable BillingEventListener listener) {
+        requireUsable(); this.listener = listener;
+    }
+    private List<String> copyIds(List<String> ids) {
+        if (ids == null) return Collections.emptyList();
+        List<String> copy = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (String id : ids) {
+            if (id == null || id.trim().isEmpty() || !seen.add(id))
+                throw new IllegalArgumentException("Product IDs must be nonempty and unique");
+            copy.add(id);
         }
+        return Collections.unmodifiableList(copy);
     }
-
-    private void resetPendingDeferredChange() {
-        isPendingDeferredChange = false;
-        pendingDeferredProductId = null;
+    private void requireConfigurable() {
+        requireUsable();
+        if (connecting || billingClient.isReady() || refreshing)
+            throw new IllegalStateException("Configure product IDs before connect()");
     }
-
-    /**
-     * To attach an event listener to establish a bridge with the caller
-     */
-    public final void setBillingEventListener(BillingEventListener billingEventListener) {
-        this.billingEventListener = billingEventListener;
+    public final BillingConnector setConsumableIds(List<String> ids) {
+        requireConfigurable(); consumableIds = copyIds(ids); return this;
     }
-
-    /**
-     * To set consumable products ids
-     */
-    public final BillingConnector setConsumableIds(List<String> consumableIds) {
-        this.consumableIds = consumableIds;
-        return this;
+    public final BillingConnector setNonConsumableIds(List<String> ids) {
+        requireConfigurable(); nonConsumableIds = copyIds(ids); return this;
     }
-
-    /**
-     * To set non-consumable products ids
-     */
-    public final BillingConnector setNonConsumableIds(List<String> nonConsumableIds) {
-        this.nonConsumableIds = nonConsumableIds;
-        return this;
+    public final BillingConnector setSubscriptionIds(List<String> ids) {
+        requireConfigurable(); subscriptionIds = copyIds(ids); return this;
     }
+    /** Opt-in only. Do not enable before an asynchronous backend grants durable entitlement. */
+    public final BillingConnector autoConsume() { requireUsable(); autoConsume = true; return this; }
+    public final BillingConnector autoAcknowledge() { requireUsable(); autoAcknowledge = true; return this; }
+    public final BillingConnector enableLogging() { requireUsable(); logging = true; return this; }
+    public final boolean isReady() { return !released && billingClient.isReady(); }
 
-    /**
-     * To set subscription products ids
-     */
-    public final BillingConnector setSubscriptionIds(List<String> subscriptionIds) {
-        this.subscriptionIds = subscriptionIds;
-        return this;
+    private void configureTypes() {
+        Map<String, SkuProductType> types = new LinkedHashMap<>();
+        addTypes(types, consumableIds, SkuProductType.CONSUMABLE);
+        addTypes(types, nonConsumableIds, SkuProductType.NON_CONSUMABLE);
+        addTypes(types, subscriptionIds, SkuProductType.SUBSCRIPTION);
+        if (types.isEmpty()) throw new IllegalArgumentException("At least one product ID is required");
+        configuredTypes.clear(); configuredTypes.putAll(types);
     }
-
-    /**
-     * To auto acknowledge the purchase
-     */
-    public final BillingConnector autoAcknowledge() {
-        shouldAutoAcknowledge = true;
-        return this;
+    private void addTypes(Map<String, SkuProductType> types, List<String> ids, SkuProductType type) {
+        for (String id : ids) if (types.put(id, type) != null)
+            throw new IllegalArgumentException("Product appears in more than one list: " + id);
     }
-
-    /**
-     * To auto consume the purchase
-     */
-    public final BillingConnector autoConsume() {
-        shouldAutoConsume = true;
-        return this;
-    }
-
-    /**
-     * To enable logging for debugging
-     */
-    public final BillingConnector enableLogging() {
-        shouldEnableLogging = true;
-        return this;
-    }
-
-    /**
-     * Returns the state of the billing client
-     */
-    public final boolean isReady() {
-        if (!isConnected) {
-            Log("Billing client is not ready because no connection is established yet");
-        }
-
-        if (!billingClient.isReady()) {
-            Log("Billing client is not ready yet");
-        }
-
-        return isConnected && billingClient.isReady() && !fetchedProductInfoList.isEmpty();
-    }
-
-    /**
-     * Returns a boolean state of the product
-     *
-     * @param productId - is the product id that has to be checked
-     */
-    private boolean checkProductBeforeInteraction(String productId) {
-        if (!isReady()) {
-            findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.CLIENT_NOT_READY,
-                    "Client is not ready yet", defaultResponseCode)));
-            return false;
-        }
-
-        boolean productExists = false;
-        if (productId != null) {
-            for (ProductInfo productInfo : fetchedProductInfoList) {
-                if (productInfo.getProduct().equals(productId)) {
-                    productExists = true;
-                    break;
-                }
+    public final BillingConnector connect() {
+        requireUsable();
+        if (listener == null) throw new IllegalStateException("Set BillingEventListener before connect()");
+        configureTypes();
+        if (connecting) return this;
+        handler.removeCallbacks(reconnectTask); reconnectScheduled = false;
+        if (billingClient.isReady()) { refreshPurchases(); return this; }
+        connecting = true;
+        billingClient.startConnection(new BillingClientStateListener() {
+            @Override public void onBillingSetupFinished(@NonNull BillingResult result) {
+                onMain(() -> {
+                    connecting = false;
+                    if (result.getResponseCode() == OK) {
+                        reconnectAttempt = 0;
+                        // Ownership recovery must not wait for a successful catalog query.
+                        refreshPurchases(); refreshProducts();
+                    } else {
+                        error(errorType(result.getResponseCode()), result);
+                        if (BillingRules.isTransient(result.getResponseCode())) scheduleReconnect();
+                    }
+                });
             }
-        }
-
-        if (productId != null && !productExists) {
-            findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.PRODUCT_NOT_EXIST,
-                    "The product id: " + productId + " doesn't seem to exist on Play Console", defaultResponseCode)));
+            @Override public void onBillingServiceDisconnected() {
+                onMain(() -> {
+                    connecting = false;
+                    error(ErrorType.CLIENT_DISCONNECTED, "Google Play billing service disconnected");
+                    scheduleReconnect();
+                });
+            }
+        });
+        return this;
+    }
+    private void scheduleReconnect() {
+        if (released || reconnectScheduled) return;
+        reconnectScheduled = true;
+        handler.postDelayed(reconnectTask, BillingRules.retryDelay(reconnectAttempt++));
+    }
+    private boolean readyOrError() {
+        if (!isReady()) {
+            error(ErrorType.CLIENT_NOT_READY, "Billing client is not ready");
+            if (!released) scheduleReconnect();
             return false;
         }
         return true;
     }
 
-    /**
-     * To connect the billing client with Play Console
-     */
-    public final BillingConnector connect() {
-        if (!isPlayStoreInstalled(context)) {
-            findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.PLAY_STORE_NOT_INSTALLED,
-                    "Google Play Store is not installed", BILLING_UNAVAILABLE)));
-            return this;
-        }
-
-        List<QueryProductDetailsParams.Product> productInAppList = new ArrayList<>();
-        List<QueryProductDetailsParams.Product> productSubsList = new ArrayList<>();
-
-        //set empty list to null so we only have to deal with lists that are null or not empty
-        if (consumableIds == null || consumableIds.isEmpty()) {
-            consumableIds = null;
-        } else {
-            for (String id : consumableIds) {
-                productInAppList.add(QueryProductDetailsParams.Product.newBuilder().setProductId(id).setProductType(INAPP).build());
-            }
-        }
-
-        if (nonConsumableIds == null || nonConsumableIds.isEmpty()) {
-            nonConsumableIds = null;
-        } else {
-            for (String id : nonConsumableIds) {
-                productInAppList.add(QueryProductDetailsParams.Product.newBuilder().setProductId(id).setProductType(INAPP).build());
-            }
-        }
-
-        if (subscriptionIds == null || subscriptionIds.isEmpty()) {
-            subscriptionIds = null;
-        } else {
-            for (String id : subscriptionIds) {
-                productSubsList.add(QueryProductDetailsParams.Product.newBuilder().setProductId(id).setProductType(SUBS).build());
-            }
-        }
-
-        allProductList.addAll(productInAppList);
-        allProductList.addAll(productSubsList);
-
-        int queryCount = 0;
-        if (!productInAppList.isEmpty()) queryCount++;
-        if (!productSubsList.isEmpty()) queryCount++;
-        productDetailsQueriesPending = queryCount;
-
-        //check if any list is provided
-        if (allProductList.isEmpty()) {
-            throw new IllegalArgumentException("At least one list of consumables, non-consumables or subscriptions is needed");
-        }
-
-        //check for duplicates product ids
-        int allIdsSize = allProductList.size();
-        int allIdsSizeDistinct = new HashSet<>(allProductList).size();
-        if (allIdsSize != allIdsSizeDistinct) {
-            throw new IllegalArgumentException("The product id must appear only once in a list. Also, it must not be in different lists");
-        }
-
-        Log("Billing service: connecting...");
-        if (!billingClient.isReady()) {
-            billingClient.startConnection(new BillingClientStateListener() {
-                @Override
-                public void onBillingServiceDisconnected() {
-                    isConnected = false;
-
-                    findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.CLIENT_DISCONNECTED,
-                            "Billing service: disconnected", defaultResponseCode)));
-
-                    Log("Billing service: Trying to reconnect...");
-                    retryBillingClientConnection();
-                }
-
-                @Override
-                public void onBillingSetupFinished(@NonNull BillingResult billingResult) {
-                    switch (billingResult.getResponseCode()) {
-                        case OK:
-                            isConnected = true;
-                            Log("Billing service: connected");
-
-                            //query consumable and non-consumable product details
-                            if (!productInAppList.isEmpty()) {
-                                queryProductDetails(INAPP, productInAppList);
-                            }
-
-                            //query subscription product details
-                            if (subscriptionIds != null) {
-                                queryProductDetails(SUBS, productSubsList);
-                            }
-                            break;
-                        case BILLING_UNAVAILABLE:
-                            Log("Billing service: unavailable");
-                            retryBillingClientConnection();
-                            break;
-                        default:
-                            Log("Billing service: error");
-                            retryBillingClientConnection();
-                            break;
+    public void refreshProducts() {
+        requireUsable(); if (!readyOrError()) return;
+        long generation = ++catalogGeneration;
+        List<String> inapp = new ArrayList<>(consumableIds); inapp.addAll(nonConsumableIds);
+        queryCatalog(INAPP, inapp, generation); queryCatalog(SUBS, subscriptionIds, generation);
+    }
+    private void queryCatalog(String type, List<String> ids, long generation) {
+        if (ids.isEmpty()) return;
+        List<QueryProductDetailsParams.Product> products = new ArrayList<>();
+        for (String id : ids) products.add(QueryProductDetailsParams.Product.newBuilder()
+                .setProductId(id).setProductType(type).build());
+        billingClient.queryProductDetailsAsync(QueryProductDetailsParams.newBuilder().setProductList(products).build(),
+                (result, details) -> onMain(() -> {
+                    if (generation != catalogGeneration) return;
+                    if (result.getResponseCode() != OK) { error(ErrorType.BILLING_ERROR, result); return; }
+                    List<ProductInfo> found = new ArrayList<>();
+                    synchronized (catalog) {
+                        for (String id : ids) catalog.remove(id);
+                        for (ProductDetails detail : details.getProductDetailsList()) {
+                            ProductInfo info = new ProductInfo(configuredTypes.get(detail.getProductId()), detail);
+                            catalog.put(info.getProduct(), info); found.add(info);
+                        }
                     }
-                }
-            });
-        }
-
-        return this;
+                    for (UnfetchedProduct missing : details.getUnfetchedProductList()) {
+                        BillingResponse response = BillingResponse.forUnfetchedProduct(
+                                "Product unavailable; unfetched status=" + missing.getStatusCode(), missing.getStatusCode());
+                        emit(l -> l.onProductQueryError(missing.getProductId(), response));
+                    }
+                    emit(l -> l.onProductsFetched(Collections.unmodifiableList(found)));
+                }));
+    }
+    public List<ProductInfo> getFetchedProductsList() {
+        synchronized (catalog) { return Collections.unmodifiableList(new ArrayList<>(catalog.values())); }
     }
 
-    /**
-     * Retries the billing client connection with exponential backoff
-     * Max out at the time specified by RECONNECT_TIMER_MAX_TIME_MILLISECONDS (15 minutes)
-     */
-    private void retryBillingClientConnection() {
-        long currentDelay = reconnectMilliseconds.get();
-        findUiHandler().postDelayed(this::connect, currentDelay);
-
-        long currentVal, newVal;
-        do {
-            currentVal = reconnectMilliseconds.get();
-            newVal = Math.min(currentVal * 2, RECONNECT_TIMER_MAX_TIME_MILLISECONDS);
-        } while (!reconnectMilliseconds.compareAndSet(currentVal, newVal));
+    public void refreshPurchases() {
+        requireUsable();
+        if (refreshing) { refreshAgain = true; return; }
+        if (!readyOrError()) { fetchedPurchasedProducts = false; emit(l -> l.onPurchasesRefreshFinished(false)); return; }
+        refreshing = true; fetchedPurchasedProducts = false;
+        BillingResult support = billingClient.isFeatureSupported(BillingClient.FeatureType.SUBSCRIPTIONS);
+        boolean querySubs = support.getResponseCode() != FEATURE_NOT_SUPPORTED;
+        Batch batch = new Batch(querySubs ? 2 : 1);
+        queryOwned(INAPP, batch);
+        if (querySubs) queryOwned(SUBS, batch);
+        else ledger.replaceType(SUBS, Collections.emptyList(), ledger.version());
     }
-
-    /**
-     * Fires a query in Play Console to show products available to purchase
-     */
-    private void queryProductDetails(String productType, List<QueryProductDetailsParams.Product> productList) {
-        QueryProductDetailsParams productDetailsParams = QueryProductDetailsParams.newBuilder().setProductList(productList).build();
-
-        billingClient.queryProductDetailsAsync(productDetailsParams, (billingResult, productDetailsList) -> {
-            if (billingResult.getResponseCode() == OK) {
-
-                HashSet<String> foundProductIds = new HashSet<>();
-                for (ProductDetails details : productDetailsList) {
-                    foundProductIds.add(details.getProductId());
-                }
-
-                for (QueryProductDetailsParams.Product requestedProduct : productList) {
-                    String productId = requestedProduct.zza(); // .zza() gets the product ID string
-                    if (!foundProductIds.contains(productId)) {
-                        Log("Error: Product ID '" + productId + "' not found. " +
-                                "Make sure it is configured correctly in the Play Console");
-                        findUiHandler().post(() -> billingEventListener.onProductQueryError(productId, new BillingResponse(ErrorType.PRODUCT_ID_QUERY_FAILED,
-                                "Product ID '" + productId + "' not found", defaultResponseCode)
-                        ));
-                    }
-                }
-
-                if (productDetailsList.isEmpty()) {
-                    Log("Query Product Details: No valid products found. Make sure product ids are configured on Play Console");
-                    findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.BILLING_ERROR,
-                            "No products found", defaultResponseCode)));
-                } else {
-                    Log("Query Product Details: data found for " + productDetailsList.size() + " products");
-
-                    List<ProductInfo> fetchedProductInfo = new ArrayList<>();
-                    for (ProductDetails productDetails : productDetailsList) {
-                        fetchedProductInfo.add(generateProductInfo(productDetails));
-                    }
-                    fetchedProductInfoList.addAll(fetchedProductInfo);
-
-                    switch (productType) {
-                        case INAPP:
-                        case SUBS:
-                            findUiHandler().post(() -> billingEventListener.onProductsFetched(fetchedProductInfo));
-                            break;
-                        default:
-                            throw new IllegalStateException("Product type is not implemented");
-                    }
-
-                    if (--productDetailsQueriesPending == 0) {
-                        fetchPurchasedProducts();
-                    }
-                }
+    private void queryOwned(String type, Batch batch) {
+        long startedVersion = ledger.version();
+        QueryPurchasesParams.Builder params = QueryPurchasesParams.newBuilder().setProductType(type);
+        if (SUBS.equals(type)) params.includeSuspendedSubscriptions(true);
+        billingClient.queryPurchasesAsync(params.build(), (result, purchases) -> onMain(() -> {
+            if (result.getResponseCode() == OK) {
+                List<PurchaseInfo> owned = convertPurchases(purchases, type, activeFlow);
+                // A malformed/signature-invalid response must not revoke known ownership.
+                if (allSignaturesValid(purchases)) {
+                    List<PurchaseLedger.Entry<PurchaseInfo>> entries = toEntries(owned);
+                    ledger.replaceType(type, entries, startedVersion);
+                    List<PurchaseInfo> current = currentForType(type);
+                    emit(l -> l.onPurchasedProductsFetched(SUBS.equals(type) ? ProductType.SUBS : ProductType.INAPP,
+                            Collections.unmodifiableList(current)));
+                    deliverEvents(current, false);
+                    correlateFlow(current);
+                } else batch.successful = false;
             } else {
-                Log("Query Product Details: failed with response code: " + billingResult.getResponseCode());
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.BILLING_ERROR, billingResult)));
+                batch.successful = false; error(ErrorType.FETCH_PURCHASED_PRODUCTS_ERROR, result);
             }
-        });
-    }
-
-    /**
-     * Returns a new ProductInfo object containing the product type and product details
-     *
-     * @param productDetails - is the object provided by the billing client API
-     */
-    @NonNull
-    private ProductInfo generateProductInfo(@NonNull ProductDetails productDetails) {
-        SkuProductType skuProductType;
-
-        switch (productDetails.getProductType()) {
-            case INAPP:
-                boolean consumable = isProductIdConsumable(productDetails.getProductId());
-                if (consumable) {
-                    skuProductType = SkuProductType.CONSUMABLE;
-                } else {
-                    skuProductType = SkuProductType.NON_CONSUMABLE;
-                }
-                break;
-            case SUBS:
-                skuProductType = SkuProductType.SUBSCRIPTION;
-                break;
-            default:
-                throw new IllegalStateException("Product type is not implemented correctly");
-        }
-
-        return new ProductInfo(skuProductType, productDetails);
-    }
-
-    private boolean isProductIdConsumable(String productId) {
-        if (consumableIds == null) {
-            return false;
-        }
-
-        return consumableIds.contains(productId);
-    }
-
-    /**
-     * Returns purchases details for currently owned items without a network request
-     */
-    private void fetchPurchasedProducts() {
-        if (billingClient.isReady()) {
-            purchaseQueriesPending = 1;
-            if (isSubscriptionSupported() == SupportState.SUPPORTED) {
-                purchaseQueriesPending++;
+            if (--batch.remaining == 0) {
+                refreshing = false; fetchedPurchasedProducts = batch.successful;
+                emit(l -> l.onPurchasesRefreshFinished(batch.successful));
+                if (refreshAgain) { refreshAgain = false; refreshPurchases(); }
             }
-
-            billingClient.queryPurchasesAsync(
-                    QueryPurchasesParams.newBuilder().setProductType(INAPP).build(),
-                    (billingResult, purchases) -> {
-                        if (billingResult.getResponseCode() == OK) {
-                            if (purchases.isEmpty()) {
-                                Log("Query IN-APP Purchases: the list is empty");
-                            } else {
-                                Log("Query IN-APP Purchases: data found and progress");
-                            }
-
-                            processPurchases(ProductType.INAPP, purchases, true);
-                        } else {
-                            Log("Query IN-APP Purchases: failed");
-                        }
-                    }
-            );
-
-            //query subscription purchases for supported devices
-            if (isSubscriptionSupported() == SupportState.SUPPORTED) {
-                billingClient.queryPurchasesAsync(
-                        QueryPurchasesParams.newBuilder().setProductType(SUBS).build(),
-                        (billingResult, purchases) -> {
-                            if (billingResult.getResponseCode() == OK) {
-                                if (purchases.isEmpty()) {
-                                    Log("Query SUBS Purchases: the list is empty");
-                                } else {
-                                    Log("Query SUBS Purchases: data found and progress");
-                                }
-
-                                processPurchases(ProductType.SUBS, purchases, true);
-                            } else {
-                                Log("Query SUBS Purchases: failed");
-                            }
-                        }
-                );
-            }
-
-        } else {
-            findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.FETCH_PURCHASED_PRODUCTS_ERROR,
-                    "Billing client is not ready yet", defaultResponseCode)));
-        }
+        }));
     }
-
-    /**
-     * Before using subscriptions, device-support must be checked
-     * Not all devices support subscriptions
-     */
-    public SupportState isSubscriptionSupported() {
-        BillingResult response = billingClient.isFeatureSupported(SUBSCRIPTIONS);
-        SupportState state;
-
-        switch (response.getResponseCode()) {
-            case OK:
-                Log("Subscriptions support check: success");
-                state = SupportState.SUPPORTED;
-                break;
-            case SERVICE_DISCONNECTED:
-                Log("Subscriptions support check: disconnected. Trying to reconnect...");
-                state = SupportState.DISCONNECTED;
-                break;
-            default:
-                Log("Subscriptions support check: error -> " + response.getResponseCode() + " " + response.getDebugMessage());
-                state = SupportState.NOT_SUPPORTED;
-                break;
-        }
-        return state;
+    private boolean allSignaturesValid(List<Purchase> purchases) {
+        for (Purchase purchase : purchases) if (!validSignature(purchase)) return false;
+        return true;
     }
-
-    /**
-     * Checks purchases signature for more security
-     */
-    private void processPurchases(ProductType productType, @NonNull List<Purchase> allPurchases, boolean purchasedProductsFetched) {
-        List<PurchaseInfo> signatureValidPurchases = new ArrayList<>();
-
-        List<Purchase> validPurchases = new ArrayList<>();
-        for (Purchase purchase : allPurchases) {
-            if (isPurchaseSignatureValid(purchase)) {
-                validPurchases.add(purchase);
-            }
-        }
-
-        Map<String, ProductInfo> productInfoMap = new HashMap<>();
-        for (ProductInfo productInfo : fetchedProductInfoList) {
-            productInfoMap.put(productInfo.getProduct(), productInfo);
-        }
-
-        for (Purchase purchase : validPurchases) {
-            for (String productId : purchase.getProducts()) {
-                ProductInfo foundProductInfo = productInfoMap.get(productId);
-                if (foundProductInfo != null) {
-                    PurchaseInfo purchaseInfo = new PurchaseInfo(foundProductInfo, purchase);
-                    signatureValidPurchases.add(purchaseInfo);
-                }
-            }
-        }
-
-        //synchronize access to purchasedProductsList
-        synchronized (purchasedProductsSync) {
-            //clear existing purchases of this type when fetching (to avoid duplicates)
-            if (purchasedProductsFetched) {
-                Iterator<PurchaseInfo> iterator = purchasedProductsList.iterator();
-                while (iterator.hasNext()) {
-                    PurchaseInfo purchaseInfo = iterator.next();
-                    boolean isSubscription = purchaseInfo.getSkuProductType() == SkuProductType.SUBSCRIPTION;
-
-                    if (productType == ProductType.SUBS && isSubscription) {
-                        iterator.remove();
-                    } else if (productType == ProductType.INAPP && !isSubscription) {
-                        iterator.remove();
-                    } else if (productType == ProductType.COMBINED) {
-                        iterator.remove();
-                    }
-                }
-            }
-
-            //add new purchases
-            purchasedProductsList.addAll(signatureValidPurchases);
-        }
-
-        if (purchasedProductsFetched) {
-            findUiHandler().post(() -> billingEventListener.onPurchasedProductsFetched(productType, signatureValidPurchases));
-            if (--purchaseQueriesPending == 0) {
-                fetchedPurchasedProducts = true;
-            }
-        } else {
-            findUiHandler().post(() -> billingEventListener.onProductsPurchased(signatureValidPurchases));
-        }
-
-        for (PurchaseInfo purchaseInfo : signatureValidPurchases) {
-            if (shouldAutoConsume) {
-                consumePurchase(purchaseInfo);
-            }
-            if (shouldAutoAcknowledge) {
-                boolean isProductConsumable = purchaseInfo.getSkuProductType() == SkuProductType.CONSUMABLE;
-                if (!isProductConsumable) {
-                    acknowledgePurchase(purchaseInfo);
-                }
-            }
-        }
+    private boolean validSignature(Purchase purchase) {
+        return context.getPackageName().equals(purchase.getPackageName())
+                && Security.verifyPurchase(base64Key, purchase.getOriginalJson(), purchase.getSignature());
     }
-
-    /**
-     * Consume consumable products so that the user can buy the item again
-     * <p>
-     * Consumable products might be bought/consumed by users multiple times (for eg. diamonds, coins etc)
-     * They have to be consumed within 3 days otherwise Google will refund the products
-     */
-    public void consumePurchase(@NonNull PurchaseInfo purchaseInfo) {
-        if (checkProductBeforeInteraction(purchaseInfo.getProduct())) {
-            if (purchaseInfo.getSkuProductType() == SkuProductType.CONSUMABLE) {
-                if (purchaseInfo.getPurchase().getPurchaseState() == Purchase.PurchaseState.PURCHASED) {
-                    ConsumeParams consumeParams = ConsumeParams.newBuilder()
-                            .setPurchaseToken(purchaseInfo.getPurchase().getPurchaseToken()).build();
-
-                    billingClient.consumeAsync(consumeParams, (billingResult, purchaseToken) -> {
-                        if (billingResult.getResponseCode() == OK) {
-                            synchronized (purchasedProductsSync) {
-                                purchasedProductsList.remove(purchaseInfo);
-                            }
-                            findUiHandler().post(() -> billingEventListener.onPurchaseConsumed(purchaseInfo));
-                        } else {
-                            Log("Handling consumables: error during consumption attempt: " + billingResult.getDebugMessage());
-
-                            findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                                    new BillingResponse(ErrorType.CONSUME_ERROR, billingResult)));
-                        }
-                    });
-                } else if (purchaseInfo.getPurchase().getPurchaseState() == Purchase.PurchaseState.PENDING) {
-                    Log("Handling consumables: purchase can not be consumed because the state is PENDING. " +
-                            "A purchase can be consumed only when the state is PURCHASED");
-
-                    findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.CONSUME_WARNING,
-                            "Warning: purchase can not be consumed because the state is PENDING. Please consume the purchase later", defaultResponseCode)));
-                }
-            }
-        }
-    }
-
-    /**
-     * Acknowledge non-consumable products & subscriptions
-     * <p>
-     * This will avoid refunding for these products to users by Google
-     */
-    public void acknowledgePurchase(@NonNull PurchaseInfo purchaseInfo) {
-        if (checkProductBeforeInteraction(purchaseInfo.getProduct())) {
-            switch (purchaseInfo.getSkuProductType()) {
-                case NON_CONSUMABLE:
-                case SUBSCRIPTION:
-                    if (purchaseInfo.getPurchase().getPurchaseState() == Purchase.PurchaseState.PURCHASED) {
-                        if (!purchaseInfo.getPurchase().isAcknowledged()) {
-                            AcknowledgePurchaseParams acknowledgePurchaseParams = AcknowledgePurchaseParams.newBuilder()
-                                    .setPurchaseToken(purchaseInfo.getPurchase().getPurchaseToken()).build();
-
-                            billingClient.acknowledgePurchase(acknowledgePurchaseParams, billingResult -> {
-                                if (billingResult.getResponseCode() == OK) {
-                                    findUiHandler().post(() -> billingEventListener.onPurchaseAcknowledged(purchaseInfo));
-                                } else {
-                                    Log("Handling acknowledges: error during acknowledgment attempt: " + billingResult.getDebugMessage());
-
-                                    findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                                            new BillingResponse(ErrorType.ACKNOWLEDGE_ERROR, billingResult)));
-                                }
-                            });
-                        }
-                    } else if (purchaseInfo.getPurchase().getPurchaseState() == Purchase.PurchaseState.PENDING) {
-                        Log("Handling acknowledges: purchase can not be acknowledged because the state is PENDING. " +
-                                "A purchase can be acknowledged only when the state is PURCHASED");
-
-                        findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.ACKNOWLEDGE_WARNING,
-                                "Warning: purchase can not be acknowledged because the state is PENDING. Please acknowledge the purchase later", defaultResponseCode)));
-                    }
-                    break;
-            }
-        }
-    }
-
-    /**
-     * Called to purchase a non-consumable/consumable product
-     */
-    public final void purchase(Activity activity, String productId) {
-        purchase(activity, productId, notAnOffer, null, null, null, -1);
-    }
-
-    /**
-     * Called to purchase a non-consumable/consumable product with custom parameters
-     *
-     * @param purchaseParams - optional purchase parameters (overrides default if set)
-     */
-    public final void purchase(Activity activity, String productId, PurchaseParams purchaseParams) {
-        purchase(activity, productId, notAnOffer, purchaseParams, null, null, -1);
-    }
-
-    /**
-     * Called to purchase a non-consumable/consumable product
-     * <p>
-     * The offer index represents the different offers in the subscription
-     * <p>
-     * ✅ DEĞİŞTİ (2. revizyon) - oldProductId eklendi. Google, abonelik
-     * değiştirme API'sini YAKIN ZAMANDA değiştirdi:
-     * {@code SubscriptionUpdateParams.setSubscriptionReplacementMode(int)}
-     * DEPRECATED oldu, yerine ÜRÜN SEVİYESİNDE
-     * {@code ProductDetailsParams.setSubscriptionProductReplacementParams(...)}
-     * geldi - bu da eski ABONELİĞİN productId'sini (sadece purchaseToken değil)
-     * bilmeyi ZORUNLU kılıyor. Google'ın kendi kuralı: "Do not call
-     * setSubscriptionReplacementMode if setSubscriptionProductReplacementParams
-     * is called for any product" - yani İKİSİ BİRDEN kullanılamaz, item-level
-     * olan (yeni, doğru) API'yi kullanıyoruz.
-     */
-    private void purchase(Activity activity, String productId, int selectedOfferIndex,
-                          PurchaseParams purchaseParams, @Nullable String oldPurchaseToken,
-                          @Nullable String oldProductId, int replacementMode) {
-        if (checkProductBeforeInteraction(productId)) {
-            ProductInfo foundProductInfo = null;
-            for (ProductInfo productInfo : fetchedProductInfoList) {
-                if (productInfo.getProduct().equals(productId)) {
-                    foundProductInfo = productInfo;
-                    break;
-                }
-            }
-
-            if (foundProductInfo != null) {
-                ProductDetails productDetails = foundProductInfo.getProductDetails();
-                BillingFlowParams.ProductDetailsParams.Builder productDetailsParamsBuilder =
-                        BillingFlowParams.ProductDetailsParams.newBuilder()
-                                .setProductDetails(productDetails);
-
-                if (productDetails.getProductType().equals(SUBS)) {
-                    List<ProductDetails.SubscriptionOfferDetails> offerDetails = productDetails.getSubscriptionOfferDetails();
-                    if (offerDetails != null && selectedOfferIndex >= 0 && selectedOfferIndex < offerDetails.size()) {
-                        productDetailsParamsBuilder.setOfferToken(offerDetails.get(selectedOfferIndex).getOfferToken());
-                    } else {
-                        Log("Invalid selectedOfferIndex: " + selectedOfferIndex + " for product: " + productId +
-                                ". Offer details size: " + (offerDetails != null ? offerDetails.size() : "null"));
-                        findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                                new BillingResponse(ErrorType.DEVELOPER_ERROR,
-                                        "Invalid subscription offer index provided", defaultResponseCode)));
-                        return;
-                    }
-
-
-                }
-
-                ImmutableList<BillingFlowParams.ProductDetailsParams> productDetailsParamsList =
-                        ImmutableList.of(productDetailsParamsBuilder.build());
-
-                // Determine which parameters to use
-                PurchaseParams paramsToUse = purchaseParams != null ? purchaseParams : defaultPurchaseParams;
-
-                // BillingFlowParams builder
-                BillingFlowParams.Builder billingFlowParamsBuilder = BillingFlowParams.newBuilder()
-                        .setProductDetailsParamsList(productDetailsParamsList);
-
-                // Apply purchase parameters if available
-                if (paramsToUse != null) {
-                    String accountId = paramsToUse.getObfuscatedAccountId();
-                    String profileId = paramsToUse.getObfuscatedProfileId();
-
-                    if (accountId != null && !accountId.isEmpty()) {
-                        billingFlowParamsBuilder.setObfuscatedAccountId(accountId);
-                        Log("Using obfuscated account ID: " + accountId);
-                    }
-                    if (profileId != null && !profileId.isEmpty()) {
-                        billingFlowParamsBuilder.setObfuscatedProfileId(profileId);
-                        Log("Using obfuscated profile ID: " + profileId);
-                    }
-
-                    if (paramsToUse.hasCustomParams()) {
-                        String customParamsJson = paramsToUse.getCustomParamsAsJson();
-                        if (customParamsJson != null) {
-                            Log("Custom parameters: " + customParamsJson);
-                        }
-                    }
-                }
-
-                // ✅ YENİ - SubscriptionUpdateParams artık SADECE oldPurchaseToken
-                // taşıyor - replacement mode ARTIK item-level (yukarıda,
-                // ProductDetailsParams üzerinde) belirleniyor. Google'ın kuralı
-                // gereği İKİSİ BİRDEN set edilemez.
-                if (oldPurchaseToken != null) {
-                    BillingFlowParams.SubscriptionUpdateParams updateParams = BillingFlowParams.SubscriptionUpdateParams.newBuilder()
-                            .setOldPurchaseToken(oldPurchaseToken)
-                            .setSubscriptionReplacementMode(replacementMode)
-                            .build();
-                    billingFlowParamsBuilder.setSubscriptionUpdateParams(updateParams);
-                }
-
-                BillingFlowParams billingFlowParams = billingFlowParamsBuilder.build();
-                BillingResult launchResult = billingClient.launchBillingFlow(activity, billingFlowParams);
-
-                // ✅ FIX - launchResult.getResponseCode()==OK, diyaloğun SADECE
-                // AÇILDIĞINI gösterir, kullanıcının onayladığını DEĞİL. Gerçek
-                // sonuç artık onPurchasesUpdated()'da (isPendingDeferredChange
-                // bayrağı üzerinden) işleniyor - burada sadece "bekliyoruz"
-                // bilgisini set ediyoruz, listener'ı ÇAĞIRMIYORUZ.
-                if (oldPurchaseToken != null
-                        && replacementMode == com.android.billingclient.api.BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.DEFERRED
-                        && launchResult.getResponseCode() == OK) {
-                    isPendingDeferredChange = true;
-                    pendingDeferredProductId = productId;
-                }
-            } else {
-                Log("Billing client can not launch billing flow because product details are missing for product: " + productId);
-                findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(ErrorType.PRODUCT_NOT_EXIST,
-                                "Product details not found for " + productId, defaultResponseCode)));
-            }
-        }
-    }
-
-    /**
-     * Verifies if a purchase still exists in the purchased products list
-     *
-     * @param purchaseInfo - the purchase to verify
-     * @return true if purchase exists and is still pending, false otherwise
-     */
-    private boolean verifyPurchaseState(PurchaseInfo purchaseInfo) {
-        synchronized (purchasedProductsSync) {
-            for (PurchaseInfo info : purchasedProductsList) {
-                if (info.getPurchase().getPurchaseToken().equals(purchaseInfo.getPurchase().getPurchaseToken())) {
-                    return true;
-                }
-            }
-        }
-
-        Log("Pending purchase no longer exists: " + purchaseInfo.getProduct());
-        notifyBillingError(ErrorType.PENDING_PURCHASE_CANCELED,
-                "Pending purchase was removed");
-        return false;
-    }
-
-    /**
-     * Retries a pending purchase for the given product ID
-     * <p>
-     * Checks if the product is in a pending state
-     * <p>
-     * Retries with exponential backoff (max 3 retries)
-     * <p>
-     * Notifies listener of success/failure
-     *
-     * @param productId - the product ID to retry
-     */
-    public void retryPendingPurchase(String productId) {
-        if (!isReady()) {
-            Log("Cannot retry pending purchase: Billing client is not ready");
-            notifyBillingError(ErrorType.CLIENT_NOT_READY, "Billing client is not ready");
-            return;
-        }
-
-        //synchronize the entire check to prevent races
-        PurchaseInfo pendingPurchase = null;
-        synchronized (purchasedProductsSync) {
-            for (PurchaseInfo purchaseInfo : purchasedProductsList) {
-                if (purchaseInfo.getProduct().equals(productId) && purchaseInfo.isPending()) {
-                    pendingPurchase = purchaseInfo;
-                    break;
-                }
-            }
-        }
-
-        if (pendingPurchase == null || !pendingPurchase.isPending()) {
-            Log("No pending purchase found for product: " + productId);
-            notifyBillingError(ErrorType.NOT_PENDING, "No pending purchase for: " + productId);
-            return;
-        }
-
-        retryPurchaseWithBackoff(pendingPurchase, 0, System.currentTimeMillis());
-    }
-
-    /**
-     * Retries a pending purchase with exponential backoff
-     * Includes acknowledgment and consume retry logic for completed purchases
-     *
-     * @param purchaseInfo - the pending purchase to retry
-     * @param retryCount   - current retry attempt (starts at 0)
-     */
-    private void retryPurchaseWithBackoff(PurchaseInfo purchaseInfo, int retryCount, long startTime) {
-        if (shouldStopRetrying(purchaseInfo, retryCount, startTime)) {
-            handleRetryFailure(purchaseInfo);
-            return;
-        }
-
-        long delayMs = calculateRetryDelay(retryCount);
-        Log("Retrying pending purchase (" + (retryCount + 1) +
-                "/" + MAX_PENDING_RETRIES + ") for: " + purchaseInfo.getProduct());
-
-        findUiHandler().postDelayed(() -> {
-            boolean shouldContinue = verifyPurchaseState(purchaseInfo);
-            if (!shouldContinue) return;
-
-            queryPurchasesForRetry(purchaseInfo, retryCount, startTime);
-        }, delayMs);
-    }
-
-    /**
-     * Queries purchases from Google Play for retry attempt
-     *
-     * @param purchaseInfo - the pending purchase being retried
-     * @param retryCount   - current number of retry attempts
-     * @param startTime    - timestamp when retries began (in milliseconds)
-     */
-    private void queryPurchasesForRetry(@NonNull PurchaseInfo purchaseInfo, int retryCount, long startTime) {
-        billingClient.queryPurchasesAsync(
-                QueryPurchasesParams.newBuilder()
-                        .setProductType(purchaseInfo.getSkuProductType() ==
-                                SkuProductType.SUBSCRIPTION ? SUBS : INAPP)
-                        .build(),
-                (billingResult, purchases) -> {
-                    if (billingResult.getResponseCode() != OK) {
-                        Log("Failed to query purchases during retry: " +
-                                billingResult.getDebugMessage());
-                        retryPurchaseWithBackoff(purchaseInfo,
-                                retryCount + 1,
-                                startTime);
-                        return;
-                    }
-
-                    handlePurchaseQueryResult(purchaseInfo, purchases, retryCount, startTime);
-                });
-    }
-
-    /**
-     * Handles the result of a purchase query during retry attempt
-     *
-     * @param originalInfo - the original pending purchase info
-     * @param purchases    - list of purchases returned from query
-     * @param retryCount   - current number of retry attempts
-     * @param startTime    - timestamp when retries began (in milliseconds)
-     */
-    private void handlePurchaseQueryResult(PurchaseInfo originalInfo, @NonNull List<Purchase> purchases, int retryCount, long startTime) {
-        Purchase completedPurchase = null;
+    private List<PurchaseInfo> convertPurchases(List<Purchase> purchases, @Nullable String queryType, @Nullable Flow flow) {
+        List<PurchaseInfo> result = new ArrayList<>();
         for (Purchase purchase : purchases) {
-            if (purchase.getPurchaseToken().equals(originalInfo.getPurchase().getPurchaseToken())) {
-                completedPurchase = purchase;
-                break;
+            if (!validSignature(purchase)) {
+                error(ErrorType.SIGNATURE_VERIFICATION_FAILED, "Purchase signature/package verification failed");
+                continue;
             }
-        }
-
-        if (completedPurchase == null) {
-            Log("Pending purchase not found, may have been canceled: " +
-                    originalInfo.getProduct());
-            notifyBillingError(ErrorType.PENDING_PURCHASE_CANCELED,
-                    "Pending purchase may have been canceled");
-            return;
-        }
-
-        if (completedPurchase.getPurchaseState() == Purchase.PurchaseState.PURCHASED) {
-            Log("Pending purchase completed: " + originalInfo.getProduct());
-            handleCompletedPurchase(originalInfo, completedPurchase);
-        } else {
-            retryPurchaseWithBackoff(originalInfo, retryCount + 1, startTime);
-        }
-    }
-
-    /**
-     * Acknowledges a purchase with retry logic
-     *
-     * @param purchaseInfo - the purchase to acknowledge
-     * @param retryCount   - current retry attempt
-     * @param maxRetries   - maximum number of retries
-     * @param listener     - to handle success/failure
-     */
-    private void acknowledgePurchaseWithRetry(@NonNull PurchaseInfo purchaseInfo, int retryCount, int maxRetries, AcknowledgeEventListener listener) {
-        if (retryCount >= maxRetries) {
-            Log("Max retries reached for acknowledgment: " + purchaseInfo.getProduct());
-            listener.onFailure();
-            return;
-        }
-
-        long delayMs = Math.min(INITIAL_RETRY_DELAY_MS * (long) Math.pow(2, retryCount), MAX_RETRY_DELAY_MS);
-
-        AcknowledgePurchaseParams params = AcknowledgePurchaseParams.newBuilder()
-                .setPurchaseToken(purchaseInfo.getPurchase().getPurchaseToken())
-                .build();
-
-        billingClient.acknowledgePurchase(params, billingResult -> {
-            if (billingResult.getResponseCode() == OK) {
-                Log("Acknowledgment successful for: " + purchaseInfo.getProduct());
-                listener.onSuccess();
-            } else {
-                Log("Acknowledgment failed (attempt " + (retryCount + 1) +
-                        "/" + maxRetries + ") for: " + purchaseInfo.getProduct() +
-                        " - " + billingResult.getDebugMessage());
-
-                findUiHandler().postDelayed(() -> acknowledgePurchaseWithRetry(purchaseInfo, retryCount + 1, maxRetries, listener), delayMs);
-            }
-        });
-    }
-
-    /**
-     * Consumes a purchase with retry logic
-     *
-     * @param purchaseInfo - the purchase to consume
-     * @param retryCount   - current retry attempt
-     * @param maxRetries   - maximum number of retries
-     * @param listener     - to handle success/failure
-     */
-    private void consumeWithRetry(@NonNull PurchaseInfo purchaseInfo, int retryCount, int maxRetries, @NonNull ConsumeEventListener listener) {
-        if (retryCount >= maxRetries) {
-            Log("Max consume retries reached for: " + purchaseInfo.getProduct());
-            listener.onFailure();
-            return;
-        }
-
-        long delayMs = Math.min(INITIAL_RETRY_DELAY_MS * (long) Math.pow(2, retryCount), MAX_RETRY_DELAY_MS);
-
-        ConsumeParams params = ConsumeParams.newBuilder()
-                .setPurchaseToken(purchaseInfo.getPurchase().getPurchaseToken())
-                .build();
-
-        billingClient.consumeAsync(params, (billingResult, purchaseToken) -> {
-            if (billingResult.getResponseCode() == OK) {
-                Log("Consume success for: " + purchaseInfo.getProduct());
-                listener.onSuccess();
-            } else {
-                Log("Consume failed (attempt " + (retryCount + 1) +
-                        "/" + maxRetries + "): " + billingResult.getDebugMessage());
-
-                findUiHandler().postDelayed(() -> consumeWithRetry(purchaseInfo, retryCount + 1, maxRetries, listener), delayMs);
-            }
-        });
-    }
-
-    /**
-     * Handles a completed purchase (state changed from PENDING to PURCHASED)
-     * Includes consume & acknowledgment retry logic with strict state validation
-     */
-    private void handleCompletedPurchase(@NonNull PurchaseInfo originalInfo, @NonNull Purchase completedPurchase) {
-        //initial state verification
-        if (completedPurchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
-            Log("Attempted to handle NON-PURCHASED item: " + completedPurchase.getPurchaseState() +
-                    " for product: " + originalInfo.getProduct());
-            return;
-        }
-
-        //verify purchase token matches
-        if (!completedPurchase.getPurchaseToken().equals(originalInfo.getPurchase().getPurchaseToken())) {
-            Log("Purchase token mismatch for product: " + originalInfo.getProduct());
-            notifyBillingError(ErrorType.DEVELOPER_ERROR, "Purchase verification failed");
-            return;
-        }
-
-        //synchronized block for thread-safe processing
-        synchronized (purchasedProductsSync) {
-            //ensure original pending entry is removed when a pending purchase completes
-            Iterator<PurchaseInfo> iterator = purchasedProductsList.iterator();
-            while (iterator.hasNext()) {
-                PurchaseInfo purchaseInfo = iterator.next();
-                if (purchaseInfo.getPurchase().getPurchaseToken().equals(originalInfo.getPurchase().getPurchaseToken()) && purchaseInfo.isPending()) {
-                    iterator.remove();
-                    break;
+            if (ledger.isConsumed(purchase.getPurchaseToken())) continue;
+            for (String id : purchase.getProducts()) {
+                ProductInfo info; synchronized (catalog) { info = catalog.get(id); }
+                SkuProductType type = configuredTypes.get(id);
+                if (type == null && info != null) type = info.getSkuProductType();
+                if (type == null && SUBS.equals(queryType)) type = SkuProductType.SUBSCRIPTION;
+                if (type == null && flow != null && flow.oldToken != null && id.equals(flow.oldProductId))
+                    type = SkuProductType.SUBSCRIPTION;
+                if (type == null) {
+                    type = SkuProductType.UNKNOWN;
+                    error(ErrorType.PURCHASE_TYPE_UNKNOWN, "Configure the purchased product type: " + id);
                 }
+                Map<String, String> metadata = localMetadataByToken.get(purchase.getPurchaseToken());
+                if (metadata == null) metadata = Collections.emptyMap();
+                if (flow != null && matches(flow, purchase)) {
+                    metadata = flow.params.getCustomParams();
+                    localMetadataByToken.put(purchase.getPurchaseToken(), metadata);
+                }
+                if (metadata.isEmpty()) {
+                    for (PurchaseInfo cached : ledger.values())
+                        if (cached.getPurchaseToken().equals(purchase.getPurchaseToken()) && cached.getProduct().equals(id)) {
+                            metadata = cached.getCustomParams(); break;
+                        }
+                }
+                PurchaseInfo converted = new PurchaseInfo(id, type, info, purchase, metadata);
+                if (acknowledgedTokens.contains(converted.getPurchaseToken())) converted.markAcknowledged();
+                result.add(converted);
             }
-
-            //re-verify state after synchronization
-            if (completedPurchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
-                Log("Purchase state changed during processing: " +
-                        completedPurchase.getPurchaseState() +
-                        " for product: " + originalInfo.getProduct());
+        }
+        return result;
+    }
+    private List<PurchaseLedger.Entry<PurchaseInfo>> toEntries(List<PurchaseInfo> purchases) {
+        List<PurchaseLedger.Entry<PurchaseInfo>> result = new ArrayList<>();
+        for (PurchaseInfo info : purchases) result.add(new PurchaseLedger.Entry<>(info.getPurchaseToken(),
+                info.getProduct(), info.getSkuProductType() == SkuProductType.SUBSCRIPTION ? SUBS : INAPP,
+                info.getPurchaseState(), info));
+        return result;
+    }
+    private List<PurchaseInfo> currentForType(String type) {
+        List<PurchaseInfo> result = new ArrayList<>();
+        for (PurchaseLedger.Entry<PurchaseInfo> entry : ledger.entries()) if (entry.type.equals(type)) result.add(entry.value);
+        return result;
+    }
+    private void onPurchasesUpdated(BillingResult result, @Nullable List<Purchase> purchases) {
+        if (result.getResponseCode() != OK) {
+            activeFlow = null; error(errorType(result.getResponseCode()), result);
+            if (result.getResponseCode() == ITEM_ALREADY_OWNED) refreshPurchases();
+            if (result.getResponseCode() == SERVICE_DISCONNECTED) scheduleReconnect();
+            return;
+        }
+        if (purchases == null || purchases.isEmpty()) { refreshPurchases(); return; }
+        List<PurchaseInfo> converted = convertPurchases(purchases, null, activeFlow);
+        for (PurchaseLedger.Entry<PurchaseInfo> entry : toEntries(converted)) ledger.upsert(entry);
+        // Use accepted ledger entries, so stale pending callbacks cannot downgrade a completed purchase.
+        List<PurchaseInfo> accepted = new ArrayList<>();
+        for (PurchaseInfo info : ledger.values()) for (PurchaseInfo candidate : converted)
+            if (info.equals(candidate)) { accepted.add(info); break; }
+        deliverEvents(accepted, true);
+        correlateFlow(accepted);
+        if (converted.isEmpty()) activeFlow = null;
+    }
+    private void deliverEvents(List<PurchaseInfo> purchases, boolean live) {
+        List<PurchaseInfo> completed = new ArrayList<>(), pending = new ArrayList<>(), suspended = new ArrayList<>();
+        Set<String> finalizeOnce = new HashSet<>();
+        List<PurchaseInfo> autoFinalize = new ArrayList<>();
+        for (PurchaseInfo info : purchases) {
+            String stateKey = info.getPurchaseToken() + ":" + info.getProduct() + ":" + info.getPurchaseState()
+                    + ":" + info.isSuspended();
+            boolean first = deliveredStates.add(stateKey);
+            if (first) {
+                if (info.isPending()) pending.add(info);
+                else if (info.isSuspended()) suspended.add(info);
+                else if (info.isPurchased() && live) completed.add(info);
+            }
+            Purchase.PendingPurchaseUpdate update = info.getPendingPurchaseUpdate();
+            if (update != null && deliveredPendingUpdates.add(info.getPurchaseToken() + ":" + update.getPurchaseToken()))
+                emit(l -> l.onPendingPurchaseUpdate(info, update));
+            if (info.isPurchased()) {
+                String target = deferredTargets.remove(info.getPurchaseToken());
+                if (target != null) emit(l -> l.onSubscriptionChangeScheduled(target));
+                if (finalizeOnce.add(info.getPurchaseToken())) autoFinalize.add(info);
+            }
+        }
+        if (!completed.isEmpty()) emit(l -> l.onProductsPurchased(Collections.unmodifiableList(completed)));
+        if (!pending.isEmpty()) emit(l -> l.onPurchasesPending(Collections.unmodifiableList(pending)));
+        if (!suspended.isEmpty()) emit(l -> l.onPurchasesSuspended(Collections.unmodifiableList(suspended)));
+        // Deliver events first. Async server integrations should leave auto-finalization disabled.
+        handler.post(() -> {
+            if (released) return;
+            for (PurchaseInfo info : autoFinalize) {
+                if (autoConsume && info.getSkuProductType() == SkuProductType.CONSUMABLE) consumePurchase(info);
+                else if (autoAcknowledge && (info.getSkuProductType() == SkuProductType.SUBSCRIPTION
+                        || info.getSkuProductType() == SkuProductType.NON_CONSUMABLE)) acknowledgePurchase(info);
+            }
+        });
+    }
+    private boolean matches(Flow flow, Purchase purchase) {
+        if (flow.oldToken == null) return purchase.getProducts().contains(flow.productId);
+        return !flow.oldToken.equals(purchase.getPurchaseToken()) &&
+                (purchase.getProducts().contains(flow.productId) || purchase.getProducts().contains(flow.oldProductId));
+    }
+    private void correlateFlow(List<PurchaseInfo> purchases) {
+        Flow flow = activeFlow; if (flow == null) return;
+        for (PurchaseInfo info : purchases) {
+            Purchase.PendingPurchaseUpdate update = info.getPendingPurchaseUpdate();
+            if (flow.oldToken != null && flow.oldToken.equals(info.getPurchaseToken()) && update != null
+                    && update.getProducts().contains(flow.productId)) {
+                activeFlow = null;
+                localMetadataByToken.put(update.getPurchaseToken(), flow.params.getCustomParams());
+                if (flow.mode == 5) deferredTargets.put(update.getPurchaseToken(), flow.productId);
                 return;
             }
-
-            PurchaseInfo completedPurchaseInfo = new PurchaseInfo(originalInfo.getProductInfo(), completedPurchase);
-
-            //process the completed purchase
-            processPurchases(
-                    originalInfo.getSkuProductType() == SkuProductType.SUBSCRIPTION ?
-                            ProductType.SUBS : ProductType.INAPP,
-                    Collections.singletonList(completedPurchase),
-                    false
-            );
-
-            //handle auto-consume for consumables
-            if (shouldAutoConsume && originalInfo.getSkuProductType() == SkuProductType.CONSUMABLE) {
-                consumeWithRetry(completedPurchaseInfo, 0, 3, new ConsumeEventListener() {
-                    @Override
-                    public void onSuccess() {
-                        synchronized (purchasedProductsSync) {
-                            purchasedProductsList.remove(completedPurchaseInfo);
-                        }
-                        findUiHandler().post(() ->
-                                billingEventListener.onPurchaseConsumed(completedPurchaseInfo));
-                    }
-
-                    @Override
-                    public void onFailure() {
-                        handleConsumeFailure(completedPurchaseInfo);
-                    }
-                });
-            }
-            //handle auto-acknowledge for non-consumables and subscriptions
-            else if (shouldAutoAcknowledge && !completedPurchase.isAcknowledged()) {
-                acknowledgePurchaseWithRetry(completedPurchaseInfo, 0, 3, new AcknowledgeEventListener() {
-                    @Override
-                    public void onSuccess() {
-                        findUiHandler().post(() ->
-                                billingEventListener.onPurchaseAcknowledged(completedPurchaseInfo));
-                    }
-
-                    @Override
-                    public void onFailure() {
-                        handleAcknowledgeFailure(completedPurchaseInfo);
-                    }
-                });
-            }
-        }
-    }
-
-    /**
-     * Calculates the next retry delay using exponential backoff
-     *
-     * @param retryCount - current number of retry attempts
-     * @return delay in milliseconds before next retry attempt
-     */
-    private long calculateRetryDelay(int retryCount) {
-        return Math.min(INITIAL_RETRY_DELAY_MS * (long) Math.pow(2, retryCount), MAX_RETRY_DELAY_MS);
-    }
-
-    /**
-     * Determines if pending purchase retries should stop based on retry count and duration
-     *
-     * @param purchaseInfo - the purchase being retried
-     * @param retryCount   - current number of retry attempts
-     * @param startTime    - timestamp when retries began (in milliseconds)
-     * @return true if retries should stop, false otherwise
-     */
-    private boolean shouldStopRetrying(PurchaseInfo purchaseInfo, int retryCount, long startTime) {
-        if (retryCount >= MAX_PENDING_RETRIES) {
-            Log("Max retry attempts reached for: " + purchaseInfo.getProduct());
-            return true;
-        }
-
-        if (System.currentTimeMillis() - startTime > MAX_PENDING_DURATION_MS) {
-            Log("Max retry duration exceeded for: " + purchaseInfo.getProduct());
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * Handles consumption failure events after all retry attempts are exhausted
-     *
-     * @param purchaseInfo - contains details about the purchase that failed consumption
-     */
-    private void handleConsumeFailure(@NonNull PurchaseInfo purchaseInfo) {
-        Log("Consume failed for: " + purchaseInfo.getProduct());
-        findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.CONSUME_ERROR,
-                "Failed to consume  purchase", defaultResponseCode)));
-    }
-
-    /**
-     * Handles acknowledgment failure events after all retry attempts are exhausted
-     *
-     * @param purchaseInfo - contains details about the purchase that failed acknowledgment
-     */
-    private void handleAcknowledgeFailure(@NonNull PurchaseInfo purchaseInfo) {
-        Log("Acknowledge failed for: " + purchaseInfo.getProduct());
-        findUiHandler().post(() -> billingEventListener.onBillingError(BillingConnector.this, new BillingResponse(ErrorType.ACKNOWLEDGE_ERROR,
-                "Failed to acknowledge purchase", defaultResponseCode)));
-    }
-
-    /**
-     * Handles failure case when max retries for a pending purchase are reached
-     * <p>
-     * Removes the failed purchase from the purchased products list and notifies listener
-     *
-     * @param purchaseInfo - the purchase that failed to complete
-     */
-    private void handleRetryFailure(@NonNull PurchaseInfo purchaseInfo) {
-        Log("Max retries reached for pending purchase: " + purchaseInfo.getProduct());
-
-        //synchronize access when removing failed purchase
-        synchronized (purchasedProductsSync) {
-            Iterator<PurchaseInfo> iterator = purchasedProductsList.iterator();
-            while (iterator.hasNext()) {
-                PurchaseInfo p = iterator.next();
-                if (p.getPurchase().getPurchaseToken().equals(purchaseInfo.getPurchase().getPurchaseToken())) {
-                    iterator.remove();
-                    break;
+            if (matches(flow, info.getPurchase())) {
+                activeFlow = null;
+                if (flow.oldToken != null && flow.mode == 5) {
+                    if (info.isPurchased()) emit(l -> l.onSubscriptionChangeScheduled(flow.productId));
+                    else if (info.isPending()) deferredTargets.put(info.getPurchaseToken(), flow.productId);
                 }
+                return;
             }
         }
-
-        notifyBillingError(ErrorType.PENDING_PURCHASE_RETRY_ERROR,
-                "Pending purchase still not completed after " + MAX_PENDING_RETRIES + " retries");
     }
 
-    /**
-     * Notifies billing event listener about an error on the UI thread
-     *
-     * @param errorType - type of error that occurred
-     * @param message   - descriptive error message
-     */
-    private void notifyBillingError(ErrorType errorType, String message) {
-        findUiHandler().post(() -> {
-            if (billingEventListener != null) {
-                billingEventListener.onBillingError(BillingConnector.this,
-                        new BillingResponse(errorType, message, defaultResponseCode));
-            }
-        });
-    }
-
-
-    /**
-     * Called to purchase a subscription with offers
-     * <p>
-     * To avoid confusion while trying to purchase a subscription
-     * Does the same thing as purchase() method
-     * <p>
-     * For subscription with only one base package, use subscribe(activity, productId) method or selectedOfferIndex = 0
-     */
-    public final void subscribe(Activity activity, String productId, int selectedOfferIndex) {
-        purchase(activity, productId, selectedOfferIndex, null, null, null, -1);
-    }
-
-    /**
-     * Called to purchase a subscription with offers and custom parameters
-     */
-    public final void subscribe(Activity activity, String productId, int selectedOfferIndex,
-                                PurchaseParams purchaseParams) {
-        purchase(activity, productId, selectedOfferIndex, purchaseParams, null, null, -1);
-    }
-
-    /**
-     * Called to purchase a simple subscription.
-     * <p>
-     * This method assumes the desired offer is the first one available (index 0).
-     * For subscriptions with multiple offers, use subscribe(activity, productId, selectedOfferIndex).
-     */
-    public final void subscribe(Activity activity, String productId) {
-        purchase(activity, productId, 0, null, null, null, -1);
-    }
-
-    /**
-     * Called to purchase a simple subscription with custom parameters
-     */
-    public final void subscribe(Activity activity, String productId, PurchaseParams purchaseParams) {
-        purchase(activity, productId, 0, purchaseParams, null, null, -1);
-    }
-
-    /**
-     * ✅ YENİ - abonelik YÜKSELTME/DÜŞÜRME/YAN GEÇİŞ (upgrade/downgrade/crossgrade).
-     * oldPurchaseToken, kullanıcının O AN aktif olan aboneliğinin
-     * purchaseToken'ı OLMAK ZORUNDA - normal subscribe()/purchase() ile
-     * "yükseltme" YAPILAMAZ (Google iki ayrı abonelik sanıp kullanıcıyı
-     * çift faturalandırabilir).
-     */
-    public final void changeSubscription(Activity activity, String newProductId, String oldProductId, String oldPurchaseToken,
-                                         @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int replacementMode) {
-        purchase(activity, newProductId, 0, null, oldPurchaseToken, oldProductId, replacementMode);
-    }
-
-    public final void changeSubscription(Activity activity, String newProductId, String oldProductId, String oldPurchaseToken,
-                                         @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int replacementMode,
-                                         int selectedOfferIndex, PurchaseParams purchaseParams) {
-        purchase(activity, newProductId, selectedOfferIndex, purchaseParams, oldPurchaseToken, oldProductId, replacementMode);
-    }
-
-    /**
-     * ✅ YENİ - cihaz/hesabın abonelik DEĞİŞTİRME (upgrade/downgrade) akışını
-     * destekleyip desteklemediğini kontrol eder - isSubscriptionSupported()'ın
-     * (düz abonelik desteği) AYRI, DAHA DAR bir kontrolü.
-     */
-    public SupportState isSubscriptionUpdateSupported() {
-        BillingResult response = billingClient.isFeatureSupported(SUBSCRIPTIONS_UPDATE);
-        switch (response.getResponseCode()) {
-            case OK:
-                return SupportState.SUPPORTED;
-            case SERVICE_DISCONNECTED:
-                return SupportState.DISCONNECTED;
-            default:
-                return SupportState.NOT_SUPPORTED;
+    public void consumePurchase(@NonNull PurchaseInfo info) {
+        requireUsable();
+        if (info.getSkuProductType() != SkuProductType.CONSUMABLE) {
+            error(ErrorType.CONSUME_ERROR, "Only configured consumable products can be consumed"); return;
         }
+        for (PurchaseInfo cached : ledger.values()) if (cached.getPurchaseToken().equals(info.getPurchaseToken())
+                && cached.getSkuProductType() != SkuProductType.CONSUMABLE) {
+            error(ErrorType.CONSUME_ERROR, "Token also contains a nonconsumable product"); return;
+        }
+        finalizePurchase(info, true);
     }
-
-    /**
-     * ✅ YENİ - fetchPurchasedProducts()'ın PUBLIC wrapper'ı - kullanıcının
-     * ELLE "satın almaları geri yükle" talebini tetiklemek için (eskiden bu
-     * metod SADECE otomatik/private olarak connect() sonrası çağrılıyordu).
-     */
-    public void refreshPurchases() {
-        fetchPurchasedProducts();
+    public void acknowledgePurchase(@NonNull PurchaseInfo info) {
+        requireUsable(); finalizePurchase(info, false);
     }
-
-    /**
-     * ✅ YENİ - kullanıcının Play hesabına göre ülke kodunu döner (bölgesel
-     * fiyatlandırma/uyumluluk kararları için).
-     */
-    public interface BillingConfigListener {
-        void onBillingConfigReceived(@Nullable String countryCode);
-
-        void onBillingConfigError(String message);
+    private void finalizePurchase(PurchaseInfo info, boolean consume) {
+        if (!info.isPurchased()) {
+            error(consume ? ErrorType.CONSUME_WARNING : ErrorType.ACKNOWLEDGE_WARNING,
+                    "Only completed, nonsuspended purchases can be finalized"); return;
+        }
+        if (!validSignature(info.getPurchase())) {
+            error(ErrorType.SIGNATURE_VERIFICATION_FAILED, "Cannot finalize an unverified purchase"); return;
+        }
+        String token = info.getPurchaseToken();
+        if (ledger.isConsumed(token)) return;
+        if (!consume && (info.isAcknowledged() || acknowledgedTokens.contains(token))) return;
+        if (!finalizingTokens.add(token)) return;
+        finishAttempt(info, consume, 0);
     }
-
-    public void queryBillingConfig(@NonNull BillingConfigListener listener) {
+    private void finishAttempt(PurchaseInfo info, boolean consume, int attempt) {
+        if (released) return;
         if (!billingClient.isReady()) {
-            listener.onBillingConfigError("Billing client is not ready");
+            scheduleReconnect();
+            finalizationResult(info, consume, attempt, BillingResult.newBuilder()
+                    .setResponseCode(SERVICE_DISCONNECTED).setDebugMessage("Billing service disconnected").build());
             return;
         }
-        GetBillingConfigParams params = GetBillingConfigParams.newBuilder().build();
-        billingClient.getBillingConfigAsync(params, (billingResult, billingConfig) -> {
-            if (billingResult.getResponseCode() == OK && billingConfig != null) {
-                listener.onBillingConfigReceived(billingConfig.getCountryCode());
-            } else {
-                listener.onBillingConfigError("Failed to get billing config: " + billingResult.getDebugMessage());
+        if (consume) billingClient.consumeAsync(ConsumeParams.newBuilder().setPurchaseToken(info.getPurchaseToken()).build(),
+                (result, token) -> onMain(() -> finalizationResult(info, true, attempt, result)));
+        else billingClient.acknowledgePurchase(AcknowledgePurchaseParams.newBuilder().setPurchaseToken(info.getPurchaseToken()).build(),
+                result -> onMain(() -> finalizationResult(info, false, attempt, result)));
+    }
+    private void finalizationResult(PurchaseInfo info, boolean consume, int attempt, BillingResult result) {
+        String token = info.getPurchaseToken();
+        if (result.getResponseCode() == OK) {
+            finalizingTokens.remove(token);
+            if (consume) { ledger.consume(token); pollingTokens.remove(token); emit(l -> l.onPurchaseConsumed(info)); }
+            else {
+                acknowledgedTokens.add(token); info.markAcknowledged();
+                for (PurchaseInfo cached : ledger.values()) if (cached.getPurchaseToken().equals(token)) cached.markAcknowledged();
+                emit(l -> l.onPurchaseAcknowledged(info));
             }
-        });
-    }
-
-    /**
-     * Called to cancel a subscription
-     */
-    public final void unsubscribe(Activity activity, String productId) {
-        try {
-            String subscriptionUrl = "http://play.google.com/store/account/subscriptions?package=" + activity.getPackageName() + "&sku=" + productId;
-
-            Intent intent = new Intent();
-            intent.setAction(Intent.ACTION_VIEW);
-            intent.setData(Uri.parse(subscriptionUrl));
-
-            activity.startActivity(intent);
-        } catch (Exception e) {
-            Log("Handling subscription cancellation: error while trying to unsubscribe"
-                    + "\nError: " + e.getMessage());
-        }
-
-    }
-
-    /**
-     * Checks if a subscription is currently active and auto-renewing
-     *
-     * @param productId - is the subscription product ID to check
-     */
-    public boolean isSubscriptionActive(String productId) {
-        synchronized (purchasedProductsSync) {
-            for (PurchaseInfo purchaseInfo : purchasedProductsList) {
-                if (purchaseInfo.getProduct().equals(productId))
-                    return purchaseInfo.getPurchase().isAutoRenewing();
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Checks if a purchase is in pending state
-     * <p>
-     * Pending purchases require completion through the Google Play Store
-     * and will eventually transition to PURCHASED or canceled state
-     *
-     * @param productId - is the product ID to check
-     */
-    public boolean isPurchasePending(String productId) {
-        synchronized (purchasedProductsSync) {
-            for (PurchaseInfo purchaseInfo : purchasedProductsList) {
-                if (purchaseInfo.getProduct().equals(productId))
-                    return purchaseInfo.getPurchase().getPurchaseState() == Purchase.PurchaseState.PENDING;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Checks if Google Play Store is installed on the device using a two-step verification:
-     * 1. Checks for the Play Store package ("com.android.vending")
-     * 2. Verifies if any app can handle Play Store URLs (fallback)
-     * <p>
-     * Will trigger both PLAY_STORE_NOT_INSTALLED and BILLING_UNAVAILABLE
-     *
-     * @param context - the application context
-     * @return true if Play Store is installed, false otherwise
-     */
-    public boolean isPlayStoreInstalled(@NonNull Context context) {
-        if (isPlayStoreInstalledByPackage(context)) {
-            return true;
-        }
-        return canHandlePlayStoreUrl(context);
-    }
-
-    /**
-     * Checks if Google Play Store is installed by verifying the existence of its package
-     *
-     * @param context - the application context
-     * @return true if Play Store package exists, false otherwise
-     */
-    private boolean isPlayStoreInstalledByPackage(@NonNull Context context) {
-        try {
-            PackageManager pm = context.getPackageManager();
-            pm.getPackageInfo("com.android.vending", PackageManager.GET_ACTIVITIES);
-            return true;
-        } catch (PackageManager.NameNotFoundException e) {
-            Log("Google Play Store is not installed");
-            return false;
-        }
-    }
-
-    /**
-     * Checks if any app (ideally Play Store) can handle Play Store URLs as a fallback verification
-     *
-     * @param context - the application context
-     * @return true if an app can handle Play Store URLs and is the actual Play Store, false otherwise
-     */
-    private boolean canHandlePlayStoreUrl(@NonNull Context context) {
-        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store"));
-        PackageManager pm = context.getPackageManager();
-        ResolveInfo resolveInfo = pm.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY);
-
-        if (resolveInfo == null) {
-            Log("Google Play Store is not installed");
-            return false;
-        }
-
-        //verify if the resolver is actually the Play Store
-        return "com.android.vending".equals(resolveInfo.activityInfo.packageName);
-    }
-
-    /**
-     * Returns a list of all purchased products.
-     */
-    public List<PurchaseInfo> getPurchasedProductsList() {
-        synchronized (purchasedProductsSync) {
-            return List.copyOf(purchasedProductsList);
-        }
-    }
-
-    /**
-     * Checks purchase state synchronously
-     */
-    public final PurchasedResult isPurchased(@NonNull ProductInfo productInfo) {
-        return checkPurchased(productInfo.getProduct());
-    }
-
-    private PurchasedResult checkPurchased(String productId) {
-        if (!isReady()) {
-            return PurchasedResult.CLIENT_NOT_READY;
-        } else if (!fetchedPurchasedProducts) {
-            return PurchasedResult.PURCHASED_PRODUCTS_NOT_FETCHED_YET;
+        } else if (BillingRules.isTransient(result.getResponseCode()) && attempt + 1 < MAX_ATTEMPTS) {
+            handler.postDelayed(() -> { if (!released) finishAttempt(info, consume, attempt + 1); }, BillingRules.retryDelay(attempt));
         } else {
-            synchronized (purchasedProductsSync) {
-                for (PurchaseInfo purchaseInfo : purchasedProductsList) {
-                    if (purchaseInfo.getProduct().equals(productId)) {
-                        return PurchasedResult.YES;
-                    }
-                }
+            finalizingTokens.remove(token);
+            error(consume ? ErrorType.CONSUME_ERROR : ErrorType.ACKNOWLEDGE_ERROR, result);
+            if (result.getResponseCode() == ITEM_NOT_OWNED) refreshPurchases();
+        }
+    }
+
+    public void retryPendingPurchase(String productId) {
+        requireUsable(); if (!readyOrError()) return;
+        PurchaseInfo found = null;
+        for (PurchaseInfo info : ledger.values()) if (info.getProduct().equals(productId) && info.isPending()) { found = info; break; }
+        if (found == null) { error(ErrorType.NOT_PENDING, "No pending purchase for " + productId); return; }
+        if (pollingTokens.add(found.getPurchaseToken())) pollPending(found, 0);
+    }
+    private void pollPending(PurchaseInfo original, int attempt) {
+        String token = original.getPurchaseToken();
+        handler.postDelayed(() -> {
+            if (released || !pollingTokens.contains(token)) return;
+            PurchaseInfo current = null;
+            for (PurchaseInfo info : ledger.values()) if (info.getPurchaseToken().equals(token)) { current = info; break; }
+            if (current == null || !current.isPending()) { pollingTokens.remove(token); return; }
+            String type = original.getSkuProductType() == SkuProductType.SUBSCRIPTION ? SUBS : INAPP;
+            billingClient.queryPurchasesAsync(QueryPurchasesParams.newBuilder().setProductType(type).build(),
+                    (result, purchases) -> onMain(() -> {
+                        if (!pollingTokens.contains(token)) return;
+                        if (result.getResponseCode() != OK) {
+                            if (BillingRules.isTransient(result.getResponseCode()) && attempt + 1 < MAX_ATTEMPTS) pollPending(original, attempt + 1);
+                            else { pollingTokens.remove(token); error(ErrorType.PENDING_PURCHASE_RETRY_ERROR, result); }
+                            return;
+                        }
+                        List<PurchaseInfo> converted = convertPurchases(purchases, type, activeFlow);
+                        PurchaseInfo match = null;
+                        for (PurchaseInfo info : converted) if (info.getPurchaseToken().equals(token)) { match = info; break; }
+                        if (match == null) {
+                            pollingTokens.remove(token);
+                            // Signature failure is not evidence of cancellation.
+                            if (allSignaturesValid(purchases)) {
+                                ledger.removeToken(token);
+                                error(ErrorType.PENDING_PURCHASE_CANCELED, "Pending purchase no longer returned by Google Play");
+                            }
+                            return;
+                        }
+                        for (PurchaseLedger.Entry<PurchaseInfo> entry : toEntries(converted)) ledger.upsert(entry);
+                        deliverEvents(converted, true);
+                        if (match.isPurchased()) {
+                            pollingTokens.remove(token);
+                            correlateFlow(Collections.singletonList(match));
+                        } else if (attempt + 1 < MAX_ATTEMPTS) pollPending(original, attempt + 1);
+                        else {
+                            pollingTokens.remove(token);
+                            // Timeout only stops polling; the payment remains pending in the cache.
+                            error(ErrorType.PENDING_PURCHASE_RETRY_ERROR, "Polling stopped; payment is still pending, not canceled");
+                        }
+                    }));
+        }, BillingRules.retryDelay(attempt));
+    }
+
+    public final void purchase(Activity activity, String productId) { purchase(activity, productId, (PurchaseParams) null); }
+    public final void purchase(Activity activity, String productId, PurchaseParams params) {
+        startFlow(activity, productId, -1, null, params, null, null, 0, false);
+    }
+    /** Explicit one-time purchase option/offer token selected from ProductInfo.getOneTimePurchaseOffers(). */
+    public final void purchaseWithOffer(Activity activity, String productId, String offerToken, PurchaseParams params) {
+        startFlow(activity, productId, -1, offerToken, params, null, null, 0, false);
+    }
+    public final void subscribe(Activity activity, String productId) { subscribe(activity, productId, 0, null); }
+    public final void subscribe(Activity activity, String productId, PurchaseParams params) { subscribe(activity, productId, 0, params); }
+    public final void subscribe(Activity activity, String productId, int index) { subscribe(activity, productId, index, null); }
+    public final void subscribe(Activity activity, String productId, int index, PurchaseParams params) {
+        startFlow(activity, productId, index, null, params, null, null, 0, true);
+    }
+    public final void subscribeWithOfferToken(Activity activity, String productId, String offerToken, PurchaseParams params) {
+        startFlow(activity, productId, -1, offerToken, params, null, null, 0, true);
+    }
+    /** Legacy replacement mode values are mapped to the new item-level values. */
+    public final void changeSubscription(Activity activity, String newId, String oldId, String token,
+            @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int mode) {
+        changeSubscription(activity, newId, oldId, token, mode, 0, null);
+    }
+    public final void changeSubscription(Activity activity, String newId, String oldId, String token,
+            @BillingFlowParams.SubscriptionUpdateParams.ReplacementMode int mode, int index, PurchaseParams params) {
+        startFlow(activity, newId, index, null, params, requireText(token, "oldPurchaseToken"),
+                requireText(oldId, "oldProductId"), BillingRules.productReplacementMode(mode), true);
+    }
+    /** Uses the NEW ProductDetailsParams replacement-mode constants, not the legacy constants. */
+    public final void changeSubscriptionWithProductReplacementMode(Activity activity, String newId, String oldId,
+            String token, int mode, String offerToken, PurchaseParams params) {
+        if (mode < 1 || mode > 6) throw new IllegalArgumentException("Invalid product replacement mode");
+        startFlow(activity, newId, -1, offerToken, params, requireText(token, "oldPurchaseToken"),
+                requireText(oldId, "oldProductId"), mode, true);
+    }
+    private static String requireText(String value, String name) {
+        if (value == null || value.isEmpty()) throw new IllegalArgumentException(name + " is required");
+        return value;
+    }
+    private void startFlow(Activity activity, String id, int index, String explicitOfferToken, PurchaseParams params,
+                           String oldToken, String oldId, int mode, boolean subscription) {
+        requireUsable(); if (!readyOrError()) return;
+        if (activeFlow != null) { error(ErrorType.PURCHASE_FLOW_IN_PROGRESS, "Another purchase flow is in progress"); return; }
+        if (activity == null || activity.isFinishing()) { error(ErrorType.DEVELOPER_ERROR, "A live Activity is required"); return; }
+        SkuProductType configured = configuredTypes.get(id);
+        if (configured == null) { error(ErrorType.PRODUCT_NOT_EXIST, "Product ID is not configured: " + id); return; }
+        if (subscription != (configured == SkuProductType.SUBSCRIPTION)) {
+            error(ErrorType.DEVELOPER_ERROR, "Product type does not match the purchase method"); return;
+        }
+        PurchaseParams selectedParams = params != null ? params.copy()
+                : defaultPurchaseParams == null ? new PurchaseParams() : defaultPurchaseParams.copy();
+        if (selectedParams.getObfuscatedProfileId() != null && selectedParams.getObfuscatedAccountId() == null) {
+            error(ErrorType.DEVELOPER_ERROR, "Profile ID requires an obfuscated account ID"); return;
+        }
+        String selectedToken = explicitOfferToken;
+        if (subscription && selectedToken == null && mode != 6) {
+            ProductInfo cached; synchronized (catalog) { cached = catalog.get(id); }
+            if (cached != null) {
+                List<SubscriptionOfferDetails> offers = cached.getSubscriptionOfferDetails();
+                if (index < 0 || index >= offers.size()) { error(ErrorType.DEVELOPER_ERROR, "Invalid offer index"); return; }
+                selectedToken = offers.get(index).getOfferToken();
             }
-            return PurchasedResult.NO;
+        }
+        Flow flow = new Flow(id, oldId, oldToken, mode, selectedParams);
+        activeFlow = flow;
+        String chosenToken = selectedToken;
+        String type = subscription ? SUBS : INAPP;
+        // Always obtain fresh ProductDetails immediately before launch.
+        billingClient.queryProductDetailsAsync(QueryProductDetailsParams.newBuilder().setProductList(
+                Collections.singletonList(QueryProductDetailsParams.Product.newBuilder().setProductId(id).setProductType(type).build())).build(),
+                (result, details) -> onMain(() -> {
+                    if (activeFlow != flow) return;
+                    if (result.getResponseCode() != OK) { activeFlow = null; error(ErrorType.BILLING_ERROR, result); return; }
+                    ProductDetails product = null;
+                    for (ProductDetails detail : details.getProductDetailsList()) if (detail.getProductId().equals(id)) { product = detail; break; }
+                    if (product == null) { activeFlow = null; error(ErrorType.PRODUCT_NOT_EXIST, "No eligible offer found for " + id); return; }
+                    if (activity.isFinishing()) { activeFlow = null; error(ErrorType.DEVELOPER_ERROR, "Activity has finished"); return; }
+                    try {
+                        launchFresh(activity, product, index, chosenToken, flow, configured);
+                    } catch (RuntimeException exception) {
+                        activeFlow = null; error(ErrorType.DEVELOPER_ERROR, "Cannot launch billing flow: " + exception.getMessage());
+                    }
+                }));
+    }
+    private void launchFresh(Activity activity, ProductDetails product, int index, String token, Flow flow, SkuProductType type) {
+        synchronized (catalog) { catalog.put(product.getProductId(), new ProductInfo(type, product)); }
+        BillingFlowParams.ProductDetailsParams.Builder item = BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(product);
+        if (SUBS.equals(product.getProductType())) {
+            if (flow.mode != 6) {
+                List<ProductDetails.SubscriptionOfferDetails> offers = product.getSubscriptionOfferDetails();
+                String validToken = null;
+                if (offers != null) {
+                    if (token != null) {
+                        for (ProductDetails.SubscriptionOfferDetails offer : offers) if (token.equals(offer.getOfferToken())) validToken = token;
+                    } else if (index >= 0 && index < offers.size()) validToken = offers.get(index).getOfferToken();
+                }
+                if (validToken == null) throw new IllegalArgumentException("Selected subscription offer is no longer eligible");
+                item.setOfferToken(validToken);
+            }
+            if (flow.oldToken != null) item.setSubscriptionProductReplacementParams(
+                    BillingFlowParams.ProductDetailsParams.SubscriptionProductReplacementParams.newBuilder()
+                            .setOldProductId(flow.oldProductId).setReplacementMode(flow.mode).build());
+        } else {
+            List<ProductDetails.OneTimePurchaseOfferDetails> offers = product.getOneTimePurchaseOfferDetailsList();
+            if (offers != null && !offers.isEmpty()) {
+                if (token == null && offers.size() > 1) throw new IllegalArgumentException("Multiple one-time offers; use purchaseWithOffer()");
+                ProductDetails.OneTimePurchaseOfferDetails selected = null;
+                for (ProductDetails.OneTimePurchaseOfferDetails offer : offers)
+                    if (token == null || token.equals(offer.getOfferToken())) { selected = offer; break; }
+                if (selected == null) throw new IllegalArgumentException("Selected one-time offer is no longer eligible");
+                item.setOfferToken(selected.getOfferToken());
+            } else if (token != null) throw new IllegalArgumentException("Selected one-time offer is unavailable");
+        }
+        BillingFlowParams.Builder builder = BillingFlowParams.newBuilder()
+                .setProductDetailsParamsList(Collections.singletonList(item.build()))
+                .setIsOfferPersonalized(flow.params.isOfferPersonalized());
+        if (flow.params.getObfuscatedAccountId() != null) builder.setObfuscatedAccountId(flow.params.getObfuscatedAccountId());
+        if (flow.params.getObfuscatedProfileId() != null) builder.setObfuscatedProfileId(flow.params.getObfuscatedProfileId());
+        if (flow.oldToken != null) builder.setSubscriptionUpdateParams(BillingFlowParams.SubscriptionUpdateParams.newBuilder()
+                .setOldPurchaseToken(flow.oldToken).build());
+        BillingResult result = billingClient.launchBillingFlow(activity, builder.build());
+        if (result.getResponseCode() != OK) { activeFlow = null; error(errorType(result.getResponseCode()), result); }
+    }
+
+    /** Shows all currently eligible Play Billing transactional in-app messages. */
+    public BillingResult showInAppMessages(@NonNull Activity activity,
+                                           @NonNull InAppMessageResponseListener responseListener) {
+        requireUsable();
+        if (activity.isFinishing()) {
+            return BillingResult.newBuilder().setResponseCode(DEVELOPER_ERROR)
+                    .setDebugMessage("A live Activity is required").build();
+        }
+        InAppMessageParams params = InAppMessageParams.newBuilder()
+                .addAllInAppMessageCategoriesToShow()
+                .build();
+        return billingClient.showInAppMessages(activity, params, responseListener);
+    }
+
+    /** Shows selected Play Billing in-app message categories. */
+    public BillingResult showInAppMessages(@NonNull Activity activity,
+                                           @NonNull List<Integer> categoryIds,
+                                           @NonNull InAppMessageResponseListener responseListener) {
+        requireUsable();
+        if (activity.isFinishing()) {
+            return BillingResult.newBuilder().setResponseCode(DEVELOPER_ERROR)
+                    .setDebugMessage("A live Activity is required").build();
+        }
+        InAppMessageParams.Builder params = InAppMessageParams.newBuilder();
+        if (categoryIds.isEmpty()) params.addAllInAppMessageCategoriesToShow();
+        else for (Integer categoryId : categoryIds) {
+            if (categoryId != null) params.addInAppMessageCategoryToShow(categoryId);
+        }
+        return billingClient.showInAppMessages(activity, params.build(), responseListener);
+    }
+
+    public SupportState isInAppMessagingSupported() {
+        return support(BillingClient.FeatureType.IN_APP_MESSAGING);
+    }
+
+    public SupportState isSubscriptionSupported() { return support(BillingClient.FeatureType.SUBSCRIPTIONS); }
+    public SupportState isSubscriptionUpdateSupported() { return isSubscriptionSupported(); }
+    private SupportState support(String feature) {
+        if (!isReady()) return SupportState.DISCONNECTED;
+        int code = billingClient.isFeatureSupported(feature).getResponseCode();
+        return code == OK ? SupportState.SUPPORTED : code == SERVICE_DISCONNECTED ? SupportState.DISCONNECTED : SupportState.NOT_SUPPORTED;
+    }
+    public interface BillingConfigListener {
+        void onBillingConfigReceived(@Nullable String countryCode);
+        void onBillingConfigError(String message);
+    }
+    public void queryBillingConfig(@NonNull BillingConfigListener configListener) {
+        requireUsable();
+        if (!isReady()) { handler.post(() -> { if (!released) configListener.onBillingConfigError("Billing client is not ready"); }); return; }
+        billingClient.getBillingConfigAsync(GetBillingConfigParams.newBuilder().build(), (result, config) -> onMain(() -> {
+            if (result.getResponseCode() == OK && config != null) configListener.onBillingConfigReceived(config.getCountryCode());
+            else configListener.onBillingConfigError(result.getDebugMessage());
+        }));
+    }
+    /** Opens management UI; cancellation is performed by the user, not this method. */
+    public final void unsubscribe(Activity activity, String productId) { openSubscriptionManagement(activity, productId); }
+    public void openSubscriptionManagement(Activity activity, String productId) {
+        requireUsable();
+        if (activity == null || activity.isFinishing()) { error(ErrorType.DEVELOPER_ERROR, "A live Activity is required"); return; }
+        Uri uri = Uri.parse("https://play.google.com/store/account/subscriptions").buildUpon()
+                .appendQueryParameter("package", activity.getPackageName()).appendQueryParameter("sku", productId).build();
+        try { activity.startActivity(new Intent(Intent.ACTION_VIEW, uri)); }
+        catch (RuntimeException exception) { error(ErrorType.BILLING_ERROR, "Cannot open subscription management: " + exception.getMessage()); }
+    }
+    /** Local nonsuspended ownership only. Backend determines expiry and authoritative entitlement. */
+    public boolean isSubscriptionActive(String id) {
+        for (PurchaseInfo info : ledger.values()) if (info.getProduct().equals(id)
+                && info.getSkuProductType() == SkuProductType.SUBSCRIPTION && info.isPurchased()) return true;
+        return false;
+    }
+    public boolean isPurchasePending(String id) {
+        for (PurchaseInfo info : ledger.values()) if (info.getProduct().equals(id) && info.isPending()) return true;
+        return false;
+    }
+    /** Diagnostic only; package visibility must never block the actual BillingClient connection. */
+    public boolean isPlayStoreInstalled(@NonNull Context context) {
+        try { context.getPackageManager().getPackageInfo("com.android.vending", 0); return true; }
+        catch (PackageManager.NameNotFoundException exception) { return false; }
+    }
+    public List<PurchaseInfo> getPurchasedProductsList() { return Collections.unmodifiableList(ledger.values()); }
+    public final PurchasedResult isPurchased(@NonNull ProductInfo info) { return isPurchased(info.getProduct()); }
+    public final PurchasedResult isPurchased(@NonNull String id) {
+        if (!isReady()) return PurchasedResult.CLIENT_NOT_READY;
+        if (!fetchedPurchasedProducts) return PurchasedResult.PURCHASED_PRODUCTS_NOT_FETCHED_YET;
+        boolean pending = false;
+        for (PurchaseInfo info : ledger.values()) if (info.getProduct().equals(id)) {
+            if (info.isPurchased()) return PurchasedResult.YES;
+            if (info.isPending()) pending = true;
+        }
+        return pending ? PurchasedResult.PENDING : PurchasedResult.NO;
+    }
+    public final BillingConnector setDefaultPurchaseParams(@Nullable PurchaseParams params) {
+        requireUsable(); defaultPurchaseParams = params == null ? null : params.copy(); return this;
+    }
+    @Nullable public final PurchaseParams getDefaultPurchaseParams() {
+        requireMain(); return defaultPurchaseParams == null ? null : defaultPurchaseParams.copy();
+    }
+    public final BillingConnector clearDefaultPurchaseParams() { return setDefaultPurchaseParams(null); }
+
+    private ErrorType errorType(int code) {
+        switch (code) {
+            case USER_CANCELED: return ErrorType.USER_CANCELED;
+            case SERVICE_DISCONNECTED: return ErrorType.CLIENT_DISCONNECTED;
+            case SERVICE_UNAVAILABLE: return ErrorType.SERVICE_UNAVAILABLE;
+            case BILLING_UNAVAILABLE: case FEATURE_NOT_SUPPORTED: return ErrorType.BILLING_UNAVAILABLE;
+            case ITEM_UNAVAILABLE: return ErrorType.ITEM_UNAVAILABLE;
+            case DEVELOPER_ERROR: return ErrorType.DEVELOPER_ERROR;
+            case ERROR: return ErrorType.ERROR;
+            case ITEM_ALREADY_OWNED: return ErrorType.ITEM_ALREADY_OWNED;
+            case ITEM_NOT_OWNED: return ErrorType.ITEM_NOT_OWNED;
+            case NETWORK_ERROR: return ErrorType.NETWORK_ERROR;
+            default: return ErrorType.BILLING_ERROR;
         }
     }
-
-    /**
-     * Set default purchase parameters to be used in all purchases
-     * This is optional and provides flexible parameter passing
-     */
-    public final BillingConnector setDefaultPurchaseParams(PurchaseParams params) {
-        this.defaultPurchaseParams = params;
-        return this;
+    @Override public void onResume(@NonNull LifecycleOwner owner) {
+        if (released || listener == null || (consumableIds.isEmpty() && nonConsumableIds.isEmpty()
+                && subscriptionIds.isEmpty())) return;
+        onMain(() -> { if (billingClient.isReady()) refreshPurchases(); else connect(); });
     }
-
-    /**
-     * Get current default purchase parameters
-     */
-    @Nullable
-    public final PurchaseParams getDefaultPurchaseParams() {
-        return defaultPurchaseParams;
-    }
-
-    /**
-     * Clear default purchase parameters
-     */
-    public final BillingConnector clearDefaultPurchaseParams() {
-        this.defaultPurchaseParams = null;
-        return this;
-    }
-
-    /**
-     * Checks purchase signature validity
-     */
-    private boolean isPurchaseSignatureValid(@NonNull Purchase purchase) {
-        boolean valid = Security.verifyPurchase(base64Key, purchase.getOriginalJson(), purchase.getSignature());
-        Log.d("SignatureDebug", "valid=" + valid + " sku=" + purchase.getProducts());
-        return valid;
-    }
-
-    /**
-     * Returns the main thread for operations that need to be executed on the UI thread
-     * <p>
-     * BillingEventListener runs on it
-     */
-    @NonNull
-    private Handler findUiHandler() {
-        return uiHandler;
-    }
-
-    /**
-     * To print a log while debugging BillingConnector
-     */
-    private void Log(String debugMessage) {
-        if (shouldEnableLogging) {
-            Log.d(TAG, debugMessage);
-        }
-    }
-
-    /**
-     * Called to release the BillingClient instance
-     * <p>
-     * To avoid leaks this method should be called when BillingConnector is no longer needed
-     */
     public void release() {
-        if (billingClient != null && billingClient.isReady()) {
-            Log("BillingConnector instance release: ending connection...");
-            billingClient.endConnection();
-        }
+        requireMain(); if (released) return;
+        released = true; handler.removeCallbacksAndMessages(null);
+        connecting = false; refreshing = false; refreshAgain = false; reconnectScheduled = false;
+        fetchedPurchasedProducts = false; activeFlow = null; listener = null;
+        finalizingTokens.clear(); pollingTokens.clear(); deliveredStates.clear(); deliveredPendingUpdates.clear(); localMetadataByToken.clear(); acknowledgedTokens.clear(); deferredTargets.clear(); ledger.clear();
+        synchronized (catalog) { catalog.clear(); }
+        if (lifecycle != null) lifecycle.removeObserver(this);
+        billingClient.endConnection();
+        log("Billing connection released");
     }
-
-    @Override
-    public void onDestroy(@NonNull LifecycleOwner owner) {
-        DefaultLifecycleObserver.super.onDestroy(owner);
-        release();
-        if (lifecycle != null) {
-            lifecycle.removeObserver(this);
-        }
-    }
+    @Override public void onDestroy(@NonNull LifecycleOwner owner) { release(); }
 }

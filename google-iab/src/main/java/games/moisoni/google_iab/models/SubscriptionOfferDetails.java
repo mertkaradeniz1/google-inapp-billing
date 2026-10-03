@@ -5,6 +5,7 @@ import androidx.annotation.NonNull;
 import com.android.billingclient.api.ProductDetails;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -15,12 +16,15 @@ public class SubscriptionOfferDetails {
     private final String offerToken;
     private final String basePlanId;
     private final List<PricingPhases> pricingPhases;
+    private final InstallmentPlanDetails installmentPlanDetails;
 
     public SubscriptionOfferDetails(String offerId, List<ProductDetails.PricingPhase> pricingPhases, List<String> offerTags, String offerToken, String basePlanId) {
         this.offerId = offerId;
-        this.offerTags = offerTags;
+        this.offerTags = offerTags == null ? Collections.emptyList()
+                : Collections.unmodifiableList(new ArrayList<>(offerTags));
         this.offerToken = offerToken;
         this.basePlanId = basePlanId;
+        this.installmentPlanDetails = null;
 
         this.pricingPhases = new ArrayList<>();
 
@@ -30,6 +34,43 @@ public class SubscriptionOfferDetails {
                 this.pricingPhases.add(newPricingPhase);
             }
         }
+    }
+
+    public SubscriptionOfferDetails(String offerId, List<ProductDetails.PricingPhase> pricingPhases,
+                                    List<String> offerTags, String offerToken, String basePlanId,
+                                    ProductDetails.InstallmentPlanDetails installmentPlanDetails) {
+        this.offerId = offerId;
+        this.offerTags = offerTags == null ? Collections.emptyList()
+                : Collections.unmodifiableList(new ArrayList<>(offerTags));
+        this.offerToken = offerToken;
+        this.basePlanId = basePlanId;
+        this.installmentPlanDetails = installmentPlanDetails == null ? null
+                : new InstallmentPlanDetails(
+                        installmentPlanDetails.getInstallmentPlanCommitmentPaymentsCount(),
+                        installmentPlanDetails.getSubsequentInstallmentPlanCommitmentPaymentsCount());
+        this.pricingPhases = new ArrayList<>();
+        if (pricingPhases != null) {
+            for (ProductDetails.PricingPhase pricingPhase : pricingPhases) {
+                this.pricingPhases.add(createPricingPhase(pricingPhase));
+            }
+        }
+    }
+
+    public InstallmentPlanDetails getInstallmentPlanDetails() {
+        return installmentPlanDetails;
+    }
+
+    public static final class InstallmentPlanDetails {
+        private final int commitmentPaymentsCount;
+        private final int subsequentCommitmentPaymentsCount;
+
+        public InstallmentPlanDetails(int commitmentPaymentsCount, int subsequentCommitmentPaymentsCount) {
+            this.commitmentPaymentsCount = commitmentPaymentsCount;
+            this.subsequentCommitmentPaymentsCount = subsequentCommitmentPaymentsCount;
+        }
+
+        public int getCommitmentPaymentsCount() { return commitmentPaymentsCount; }
+        public int getSubsequentCommitmentPaymentsCount() { return subsequentCommitmentPaymentsCount; }
     }
 
     public String getOfferId() {
@@ -49,7 +90,7 @@ public class SubscriptionOfferDetails {
     }
 
     public List<PricingPhases> getPricingPhases() {
-        return pricingPhases;
+        return Collections.unmodifiableList(pricingPhases);
     }
 
     @NonNull

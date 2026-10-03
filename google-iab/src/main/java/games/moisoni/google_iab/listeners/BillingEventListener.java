@@ -29,7 +29,7 @@ public interface BillingEventListener {
     /**
      * Callback will be triggered when a product is purchased successfully
      *
-     * @param purchases - a list with purchased products
+     * @param purchases - completed, locally signature-verified purchases; backend verification is still required
      */
     void onProductsPurchased(@NonNull List<PurchaseInfo> purchases);
 
@@ -63,13 +63,18 @@ public interface BillingEventListener {
      */
     void onProductQueryError(@NonNull String productId, @NonNull BillingResponse response);
 
-    /**
-     * ✅ YENİ - SADECE DEFERRED modlu bir changeSubscription() sonrası
-     * tetiklenir. DEFERRED'da değişiklik ANINDA uygulanmaz (mevcut dönemin
-     * SONUNDA devreye girer), bu yüzden normal onProductsPurchased() akışı
-     * HİÇ TETİKLENMEZ - Google Play sadece "değişiklik planlandı" der.
-     * Varsayılan (default) boş bırakıldı - DEFERRED kullanmayan
-     * implementasyonlar bunu override ETMEK ZORUNDA DEĞİL.
-     */
+    /** A scheduled change does not grant entitlement to the target plan yet. */
     default void onSubscriptionChangeScheduled(@NonNull String productId) {}
+
+    /** Pending payments must not grant entitlement. */
+    default void onPurchasesPending(@NonNull List<PurchaseInfo> purchases) {}
+
+    /** Current subscription remains owned while a prepaid update is awaiting payment. */
+    default void onPendingPurchaseUpdate(@NonNull PurchaseInfo currentPurchase,
+                                        @NonNull com.android.billingclient.api.Purchase.PendingPurchaseUpdate update) {}
+
+    default void onPurchasesSuspended(@NonNull List<PurchaseInfo> purchases) {}
+
+    /** Both ownership queries are finished; false means at least one query failed. */
+    default void onPurchasesRefreshFinished(boolean successful) {}
 }

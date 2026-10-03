@@ -4,18 +4,14 @@ plugins {
 }
 
 android {
-
     namespace 'games.moisoni.google_iab'
-
     compileSdkVersion 37
 
     defaultConfig {
-        minSdkVersion 21
-
-        multiDexEnabled true
-
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
-        consumerProguardFiles "consumer-rules.pro"
+        // Google Play Billing 9.1.0 requires API 23 or newer.
+        minSdkVersion 23
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+        consumerProguardFiles 'consumer-rules.pro'
     }
 
     buildTypes {
@@ -31,22 +27,10 @@ android {
     }
 
     publishing {
-        singleVariant("release") {
+        singleVariant('release') {
             withSourcesJar()
             withJavadocJar()
         }
-
-        multipleVariants {
-            withSourcesJar()
-            withJavadocJar()
-            allVariants()
-        }
-    }
-    lint {
-        targetSdk 37
-    }
-    testOptions {
-        targetSdk 37
     }
 }
 
@@ -55,22 +39,18 @@ afterEvaluate {
         publications {
             release(MavenPublication) {
                 from components.release
-                groupId = 'com.github.moisoni97'
+                groupId = 'com.github.mertkaradeniz1'
                 artifactId = 'google-inapp-billing'
-                version = '1.1.7'
+                version = '1.1.8'
             }
         }
     }
 }
 
 dependencies {
+    // These types appear in the public API, so expose their compile dependencies.
+    api libs.billing
+    api libs.lifecycle.common
+    api libs.annotation
     testImplementation libs.junit
-    androidTestImplementation libs.ext.junit
-    androidTestImplementation libs.espresso.core
-
-    implementation libs.appcompat
-    implementation libs.material
-    implementation libs.guava
-
-    implementation libs.billing
 }
